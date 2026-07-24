@@ -47,6 +47,10 @@ class PatchEmbed3D(nn.Module):
     """
     Image to Patch Embedding
     """
+    # The convolution moves the kernel by the stride amount.
+    # 1. We move horizontally (along W) by patch_size (16 pixels)
+    # 2. We move vertically (along H) by patch_size (16 pixels)
+    # 3. We move temporally (along T) by tubelet_size (2 frames)
 
     def __init__(
         self,
@@ -62,11 +66,11 @@ class PatchEmbed3D(nn.Module):
         self.proj = nn.Conv3d(
             in_channels=in_chans,
             out_channels=embed_dim,
-            kernel_size=(tubelet_size, patch_size, patch_size),
-            stride=(tubelet_size, patch_size, patch_size),
+            kernel_size=(tubelet_size, patch_size, patch_size), # (2, 16, 16)
+            stride=(tubelet_size, patch_size, patch_size),      # (2, 16, 16)
         )
 
     def forward(self, x, **kwargs):
         B, C, T, H, W = x.shape
-        x = self.proj(x).flatten(2).transpose(1, 2)
+        x = self.proj(x).flatten(2).transpose(1, 2) # (B, embed_dim, T*H*W) -> (B, T*H*W, embed_dim)
         return x
