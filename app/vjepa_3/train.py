@@ -21,6 +21,7 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from app.vjepa_3.diagnostics import gaussian_floor, isotropy_report
 from app.vjepa_3.models.utils.masks_dist import compute_mask_distance
 from app.vjepa_3.models.utils.modules import Lambda_LinearWarmupHold
 from app.vjepa_3.transforms import make_transforms
@@ -69,6 +70,11 @@ def main(args, resume_preempt=False):
     skip_batches = cfgs_meta.get("skip_batches", -1)
     use_sdpa = cfgs_meta.get("use_sdpa", False)
     sync_gc = cfgs_meta.get("sync_gc", False)
+    # -- V-JEPA 3: every N iterations, log how close the target-encoder
+    #    features are to an isotropic Gaussian (app/vjepa_3/diagnostics.py).
+    #    Measurement only -- it never touches the loss.  0 = off, in which
+    #    case the training loop below is unchanged.
+    sigreg_diag_freq = cfgs_meta.get("sigreg_diag_freq", 0)
     logger.info(f"LD_PRELOAD: {os.environ.get('LD_PRELOAD')}")
     which_dtype = cfgs_meta.get("dtype")
     logger.info(f"{which_dtype=}")
@@ -119,6 +125,13 @@ def main(args, resume_preempt=False):
     use_string_predictor = cfgs_model.get("use_string_predictor", False)
     string_share_across_layers = cfgs_model.get("string_share_across_layers", False)
     string_init_std = cfgs_model.get("string_init_std", 0.0)
+    # -- V-JEPA 3 FFN and norm variants.  null => V-JEPA 2.1 behaviour
+    #    (GELU MLP unless use_silu, LayerNorm everywhere).  See
+    #    models/utils/ffn.py and models/utils/norms.py.
+    ffn_type = cfgs_model.get("ffn_type", None)
+    pred_ffn_type = cfgs_model.get("pred_ffn_type", None)
+    norm_type = cfgs_model.get("norm_type", None)
+    norm_out_type = cfgs_model.get("norm_out_type", None)
     lambda_value_img = cfgs_model.get("lambda_value_img", 0.0)
     lambda_value_vid = cfgs_model.get("lambda_value_vid", 0.0)
     n_registers_predictor = cfgs_model.get("n_registers_predictor", 0)
@@ -258,6 +271,20 @@ def main(args, resume_preempt=False):
     if cfgs_img_data is not None:
         img_world_size = int(world_size * img_rank_ratio)
         num_video_ranks = world_size - img_world_size
+        # -- V-JEPA 3: V-JEPA 2.1 hit `% img_world_size` below with
+        #    img_world_size == 0 (ZeroDivisionError) on a single GPU, and with
+        #    img_rank_ratio = 1.0 the same for num_video_ranks.  Images and
+        #    video are trained on DISJOINT ranks, so joint training needs at
+        #    least one rank of each.
+        if img_world_size == 0 or num_video_ranks == 0:
+            raise ValueError(
+                f"img_data is set, but world_size={world_size} with "
+                f"rank_ratio={img_rank_ratio} gives {img_world_size} image "
+                f"rank(s) and {num_video_ranks} video rank(s). Joint "
+                "image+video training needs at least one of each (>= 2 GPUs). "
+                "On a single GPU, remove the img_data / img_mask sections "
+                "(see configs/train_3/proxy/base-1gpu.yaml)."
+            )
         img_total_batch_size = img_dataset_batch_size * world_size
         video_total_batch_size = batch_size * world_size
 
@@ -362,6 +389,20 @@ def main(args, resume_preempt=False):
         ("%d", "gpu-time(ms)"),
         ("%d", "dataload-time(ms)"),
     )
+    # -- V-JEPA 3: a separate file, because CSVLogger's columns are fixed at
+    #    construction and log_r*.csv is parsed by existing tooling.  Rank 0
+    #    only: one reading per step is enough, and it keeps the other ranks'
+    #    step time untouched.
+    diag_logger = None
+    if sigreg_diag_freq > 0 and rank == 0:
+        diag_logger = CSVLogger(
+            os.path.join(folder, f"diag_r{rank}.csv"),
+            ("%d", "epoch"),
+            ("%d", "itr"),
+            ("%.5f", "sigreg_raw"),
+            ("%.5f", "sigreg_std"),
+            ("%d", "n_tokens"),
+        )
 
     # -- init model
     encoder, predictor = init_video_model(
@@ -401,6 +442,10 @@ def main(args, resume_preempt=False):
         string_share_across_layers=string_share_across_layers,
         string_init_std=string_init_std,
         modality_embedding=modality_embedding,
+        ffn_type=ffn_type,
+        pred_ffn_type=pred_ffn_type,
+        norm_type=norm_type,
+        norm_out_type=norm_out_type,
     )
     target_encoder = copy.deepcopy(encoder)
 
@@ -628,6 +673,14 @@ def main(args, resume_preempt=False):
                 logger.info("Running garbage collection...")
                 gc.collect()
 
+            # -- V-JEPA 3 isotropy diagnostic: decided out here so that
+            #    train_step's closures only read it.
+            diag_due = (
+                diag_logger is not None
+                and (epoch * ipe + itr) % sigreg_diag_freq == 0
+            )
+            diag_stats = {}
+
             def train_step():
                 _new_lr = scheduler.step()
                 _new_wd = wd_scheduler.step()
@@ -635,6 +688,16 @@ def main(args, resume_preempt=False):
                 def forward_target(c, embed_dim=embed_dim_encoder):
                     with torch.no_grad():
                         h = target_encoder(c, gram_mode=False, training_mode=True)
+                        if diag_due:
+                            # Last deep-supervision level of the first clip
+                            # group, BEFORE the loss-side F.layer_norm below:
+                            # that standardisation would hide exactly the
+                            # scale/shape information being measured.
+                            diag_stats.update(
+                                isotropy_report(
+                                    h[0][:, :, -embed_dim:], seed=epoch * ipe + itr
+                                )
+                            )
                         new_h = []
                         for hi in h:
                             if levels_predictor > 1:
@@ -831,6 +894,27 @@ def main(args, resume_preempt=False):
                     gpu_etime_ms,
                     data_elapsed_time_ms,
                 )
+                if diag_stats:
+                    diag_logger.log(
+                        epoch + 1,
+                        itr,
+                        diag_stats["sigreg_raw"],
+                        diag_stats["sigreg_std"],
+                        diag_stats["n"],
+                    )
+                    logger.info(
+                        "[%d, %5d] isotropy: sigreg_raw %.3f (floor %.2f) "
+                        "sigreg_std %.3f (floor %.2f) [n: %d]"
+                        % (
+                            epoch + 1,
+                            itr,
+                            diag_stats["sigreg_raw"],
+                            gaussian_floor(),
+                            diag_stats["sigreg_std"],
+                            gaussian_floor(standardized=True),
+                            diag_stats["n"],
+                        )
+                    )
                 if (
                     (itr % log_freq == 0)
                     or (itr == ipe - 1)

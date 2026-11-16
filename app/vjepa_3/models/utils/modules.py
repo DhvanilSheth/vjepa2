@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 from timm.models.layers import drop_path
 
+from app.vjepa_3.models.utils.ffn import GLU_GATES, MLP_ACTS
 from app.vjepa_3.models.utils.string import apply_string
 
 
@@ -204,8 +205,14 @@ class SwiGLUFFN(nn.Module):
         act_layer=nn.SiLU,
         drop=0.0,
         wide_silu=True,
+        # -- V-JEPA 3: the gate nonlinearity.  F.silu is what V-JEPA 2.1
+        #    hardcoded in forward(), so the default is bitwise unchanged.
+        #    Note `act_layer` above is accepted but was never used by 2.1's
+        #    forward; `gate_fn` is the knob that actually takes effect.
+        gate_fn=F.silu,
     ):
         super().__init__()
+        self.gate_fn = gate_fn
         out_features = out_features or in_features
         swiglu_hidden_features = hidden_features = hidden_features or in_features
         if wide_silu:
@@ -222,8 +229,39 @@ class SwiGLUFFN(nn.Module):
     def forward(self, x):
         x1 = self.fc1(x)
         x2 = self.fc2(x)
-        hidden = F.silu(x1) * x2
+        hidden = self.gate_fn(x1) * x2
         return self.fc3(hidden)
+
+
+def build_ffn(ffn_type, dim, hidden_dim, drop=0.0, wide_silu=True):
+    """V-JEPA 3: build the feed-forward sub-layer named by `ffn_type`.
+
+    See models/utils/ffn.py for the list of variants and the evidence behind
+    each.  Called only when `ffn_type` is set; with `ffn_type=None` Block
+    takes its original V-JEPA 2.1 branch and never reaches this function.
+
+    `hidden_dim` is the MLP hidden width (dim * mlp_ratio).  For the GLU
+    family with wide_silu=True, SwiGLUFFN shrinks it to 2/3 internally.
+    """
+    if ffn_type in MLP_ACTS:
+        return MLP(
+            in_features=dim,
+            hidden_features=hidden_dim,
+            act_layer=MLP_ACTS[ffn_type],
+            drop=drop,
+        )
+    if ffn_type in GLU_GATES:
+        return SwiGLUFFN(
+            in_features=dim,
+            hidden_features=hidden_dim,
+            wide_silu=wide_silu,
+            drop=drop,
+            gate_fn=GLU_GATES[ffn_type],
+        )
+    raise ValueError(
+        f"Unknown ffn_type {ffn_type!r}. "
+        f"Known: {sorted(tuple(MLP_ACTS) + tuple(GLU_GATES))}."
+    )
 
 
 class RoPEAttention(nn.Module):
@@ -543,6 +581,9 @@ class Block(nn.Module):
         #    predictor.py today and vanishes exactly this way.
         rope_theta=DEFAULT_ROPE_THETA,
         rope_temporal_scale=1.0,
+        # -- V-JEPA 3 FFN variant (models/utils/ffn.py).  None => the legacy
+        #    `act_layer is nn.SiLU` branch below, untouched from 2.1.
+        ffn_type=None,
         **kwargs,
     ):
         super().__init__()
@@ -581,7 +622,15 @@ class Block(nn.Module):
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
-        if act_layer is nn.SiLU:
+        if ffn_type is not None:
+            self.mlp = build_ffn(
+                ffn_type,
+                dim=dim,
+                hidden_dim=mlp_hidden_dim,
+                drop=drop,
+                wide_silu=wide_silu,
+            )
+        elif act_layer is nn.SiLU:
             self.mlp = SwiGLUFFN(
                 in_features=dim,
                 hidden_features=mlp_hidden_dim,

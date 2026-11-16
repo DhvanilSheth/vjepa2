@@ -13,7 +13,9 @@ import torch.nn as nn
 from src.masks.utils import apply_masks
 from src.utils.tensors import repeat_interleave_batch, trunc_normal_
 
+from app.vjepa_3.models.utils.ffn import resolve_ffn_type
 from app.vjepa_3.models.utils.modules import DEFAULT_ROPE_THETA, Block
+from app.vjepa_3.models.utils.norms import build_norm_layer
 from app.vjepa_3.models.utils.string import CayleySTRING
 
 
@@ -67,9 +69,20 @@ class VisionTransformerPredictor(nn.Module):
         use_string=False,
         string_share_across_layers=False,
         string_init_std=0.0,
+        # -- V-JEPA 3 FFN / norm variants; see vision_transformer.py.  Here
+        #    norm_out_type covers `predictor_norm`.
+        ffn_type=None,
+        norm_type=None,
+        norm_out_type=None,
         **kwargs
     ):
         super().__init__()
+        ffn_type = resolve_ffn_type(ffn_type, use_silu)
+        if norm_type is not None:
+            norm_layer = build_norm_layer(norm_type)
+        out_norm_layer = (
+            build_norm_layer(norm_out_type) if norm_out_type is not None else norm_layer
+        )
         self.return_all_tokens = return_all_tokens
         self.chop_last_n_tokens = chop_last_n_tokens
         self.has_cls_first = has_cls_first
@@ -187,6 +200,7 @@ class VisionTransformerPredictor(nn.Module):
                     patch_size=patch_size,
                     rope_theta=rope_theta,
                     rope_temporal_scale=rope_temporal_scale,
+                    ffn_type=ffn_type,
                 )
                 for i in range(depth)
             ]
@@ -209,7 +223,7 @@ class VisionTransformerPredictor(nn.Module):
                 out_embed_dim = teacher_embed_dim // len(self.hierarchical_layers)
             else:
                 out_embed_dim = embed_dim
-        self.predictor_norm = norm_layer(predictor_embed_dim)
+        self.predictor_norm = out_norm_layer(predictor_embed_dim)
         self.predictor_proj = nn.Linear(
             predictor_embed_dim,
             len(self.hierarchical_layers) * out_embed_dim,

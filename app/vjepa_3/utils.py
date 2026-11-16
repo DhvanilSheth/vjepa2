@@ -228,6 +228,12 @@ def init_video_model(
     string_share_across_layers=False,
     string_init_std=0.0,
     modality_embedding=False,
+    # -- V-JEPA 3 FFN / norm variants.  ffn_type is per-model (mirrors
+    #    use_silu / use_pred_silu); the norm keys apply to both models.
+    ffn_type=None,
+    pred_ffn_type=None,
+    norm_type=None,
+    norm_out_type=None,
 ):
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
@@ -252,6 +258,9 @@ def init_video_model(
         string_share_across_layers=string_share_across_layers,
         string_init_std=string_init_std,
         modality_embedding=modality_embedding,
+        ffn_type=ffn_type,
+        norm_type=norm_type,
+        norm_out_type=norm_out_type,
     )
     encoder = MultiSeqWrapper(encoder)
     predictor = vit_pred.__dict__["vit_predictor"](
@@ -287,6 +296,9 @@ def init_video_model(
         string_init_std=string_init_std,
         modality_embedding=modality_embedding,
         img_temporal_dim_size=img_temporal_dim_size,
+        ffn_type=pred_ffn_type,
+        norm_type=norm_type,
+        norm_out_type=norm_out_type,
     )
     predictor = PredictorMultiSeqWrapper(predictor)
 

@@ -13,7 +13,9 @@ import torch.nn as nn
 from src.masks.utils import apply_masks
 from src.utils.tensors import trunc_normal_
 
+from app.vjepa_3.models.utils.ffn import resolve_ffn_type
 from app.vjepa_3.models.utils.modules import DEFAULT_ROPE_THETA, Block
+from app.vjepa_3.models.utils.norms import build_norm_layer
 from app.vjepa_3.models.utils.patch_embed import PatchEmbed, PatchEmbed3D
 from app.vjepa_3.models.utils.string import CayleySTRING
 
@@ -64,9 +66,24 @@ class VisionTransformer(nn.Module):
         use_string=False,
         string_share_across_layers=False,
         string_init_std=0.0,
+        # -- V-JEPA 3 FFN variant (models/utils/ffn.py).  None => legacy
+        #    `use_silu` switch, i.e. the V-JEPA 2.1 path.
+        ffn_type=None,
+        # -- V-JEPA 3 normalization-free variants (models/utils/norms.py).
+        #    None => keep the `norm_layer` the factory passed (LayerNorm).
+        #    norm_out_type covers only `norms_block` and defaults to
+        #    following norm_type.
+        norm_type=None,
+        norm_out_type=None,
         **kwargs,
     ):
         super().__init__()
+        ffn_type = resolve_ffn_type(ffn_type, use_silu)
+        if norm_type is not None:
+            norm_layer = build_norm_layer(norm_type)
+        out_norm_layer = (
+            build_norm_layer(norm_out_type) if norm_out_type is not None else norm_layer
+        )
         self.num_features = self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.out_layers = out_layers
@@ -146,6 +163,7 @@ class VisionTransformer(nn.Module):
                     patch_size=patch_size,
                     rope_theta=rope_theta,
                     rope_temporal_scale=rope_temporal_scale,
+                    ffn_type=ffn_type,
                 )
                 for i in range(depth)
             ]
@@ -205,7 +223,7 @@ class VisionTransformer(nn.Module):
         else:
             print("Check the code! ;)")
         self.norms_block = nn.ModuleList(
-            [norm_layer(embed_dim) for _ in range(len(self.hierarchical_layers))]
+            [out_norm_layer(embed_dim) for _ in range(len(self.hierarchical_layers))]
         )
 
         self.cls_token = None

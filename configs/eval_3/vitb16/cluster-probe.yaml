@@ -1,0 +1,39 @@
+# V-JEPA 3 frozen-feature clustering probe (evals/feature_clustering_frozen).
+# Single GPU:
+#   python -m evals.main --fname configs/eval_3/vitb16/cluster-probe.yaml --devices cuda:0
+#
+# The encoder architecture is NOT described here.  It is read from
+# <folder>/params-pretrain.yaml, the copy of the training config that
+# app/main.py writes into the run folder, so the probe always rebuilds the
+# model that produced the checkpoint.
+eval_name: feature_clustering_frozen
+tag: cluster-probe
+# Run folder of the pre-training job (its `folder:` key).
+folder: /your_folder/pretrain_3/ladder/a0-control
+checkpoint: latest.pth.tar
+# target_encoder = the EMA weights, which is what V-JEPA evaluates.
+checkpoint_key: target_encoder
+experiment:
+  batch_size: 16
+  num_workers: 8
+  use_bfloat16: true
+  data:
+    dataset_type: VideoDataset
+    # CSV of "<video path> <integer label>" rows, same format as the
+    # classification evals.  A validation split is enough: nothing is trained.
+    dataset_val: /your_data/k400_val_paths.csv
+    num_classes: 400
+    resolution: 256
+    frames_per_clip: 16
+    frame_step: 4
+    num_segments: 2
+    num_views_per_segment: 1
+  clustering:
+    # Each listed clusterer is run and scored.  `emeans` needs Faiss >= 1.16;
+    # remove it if Faiss is not installed.
+    clusterers:
+    - kmeans
+    - emeans
+    # null => one cluster per class (num_classes).
+    k: null
+    seed: 0

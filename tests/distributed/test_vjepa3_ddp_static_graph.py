@@ -84,7 +84,7 @@ _SKIP_STRING = [False]
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-def _worker(rank, world_size, gated, port, out):
+def _worker(rank, world_size, gated, port, out, extra_kwargs=None, training=False):
     """One DDP rank.  rank 0 feeds T=1 images, rank 1 feeds T=8 video."""
     try:
         # mp spawn starts a FRESH interpreter that does not inherit sys.path,
@@ -120,6 +120,7 @@ def _worker(rank, world_size, gated, port, out):
             img_temporal_dim_size=1,
             use_string=True,
             string_init_std=0.1,
+            **(extra_kwargs or {}),
         )
         ddp = DistributedDataParallel(model, static_graph=True)
         opt = torch.optim.SGD(ddp.parameters(), lr=1e-3)
@@ -134,7 +135,12 @@ def _worker(rank, world_size, gated, port, out):
             _SKIP_STRING[0] = gated and (rank == 0) and (step % 2 == 1)
             opt.zero_grad()
             x = torch.randn(1, 3, n_frames, CROP, CROP)
-            ddp(x)[-1].sum().backward()
+            if training:
+                # what train.py does: all four deep-supervision levels are
+                # returned, so all four output norms are in the graph
+                ddp(x, training=True).sum().backward()
+            else:
+                ddp(x)[-1].sum().backward()
             opt.step()
 
         grad = model.string.weight.grad
@@ -152,12 +158,14 @@ def _worker(rank, world_size, gated, port, out):
             dist.destroy_process_group()
 
 
-def _run(gated, port):
+def _run(gated, port, extra_kwargs=None, training=False):
     """Spawn 2 ranks; return (all_ok, [messages])."""
     ctx = mp.get_context("spawn")
     out = ctx.Queue()
     procs = [
-        ctx.Process(target=_worker, args=(rank, 2, gated, port, out))
+        ctx.Process(
+            target=_worker, args=(rank, 2, gated, port, out, extra_kwargs, training)
+        )
         for rank in range(2)
     ]
     for p in procs:
@@ -197,6 +205,29 @@ class TestDDPStaticGraph(unittest.TestCase):
             self.assertGreater(
                 grad_max, 0.0, f"rank {rank}: zero gradient -- P was not used"
             )
+
+    def test_positive_all_flags_survive_static_graph(self):
+        """STRING + a GLU feed-forward + Derf norms + a per-axis RoPE base,
+        together, in training mode, across an image rank and a video rank.
+
+        None of the newer flags adds a conditionally-used parameter (Derf's
+        alpha/shift and the GLU's third linear are used on every token of
+        every step), so this is expected to pass -- the test exists so that
+        stays true when someone adds a flag that is not.
+        """
+        ok, messages, results = _run(
+            gated=False,
+            port=29553,
+            extra_kwargs=dict(
+                ffn_type="swiglu",
+                norm_type="derf",
+                rope_theta=[100.0, 10000.0, 10000.0],
+            ),
+            training=True,
+        )
+        self.assertTrue(ok, "all-flags model failed under static_graph:\n" + "\n".join(messages))
+        for rank, _, grad_max in results:
+            self.assertGreater(grad_max, 0.0, f"rank {rank}: zero gradient on string.weight")
 
     def test_negative_control_gated_string_fails(self):
         """A gated P MUST break. If this passes, the test above proves nothing."""
