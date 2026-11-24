@@ -192,10 +192,59 @@ class TestSingleGpuProxyBase(unittest.TestCase):
         paper = yaml.safe_load(
             (CONFIG_DIR / "vitb16" / "pretrain-256px-16f.yaml").read_text()
         )
-        self.assertEqual(self.cfg["model"], paper["model"])
+        # The one documented `model:` difference: activation checkpointing
+        # is off (it trades compute for memory the proxy does not need).  It
+        # changes no parameter and no gradient.
+        model, paper_model = dict(self.cfg["model"]), dict(paper["model"])
+        self.assertFalse(model.pop("use_activation_checkpointing"))
+        self.assertTrue(paper_model.pop("use_activation_checkpointing"))
+        self.assertEqual(model, paper_model)
         self.assertEqual(self.cfg["mask"], paper["mask"])
         self.assertEqual(self.cfg["loss"], paper["loss"])
         self.assertEqual(self.cfg["data_aug"], paper["data_aug"])
+
+
+class TestContextLossWarmup(unittest.TestCase):
+    """The context ("dense") loss must actually switch on inside a run.
+
+    V-JEPA 2.1 hard-codes its warm-up at iterations 15,000 -> 30,000, 5% ->
+    10% of a 300,000-iteration recipe.  A proxy run is far shorter, so the
+    absolute numbers would leave the loss off for most or all of it.
+    """
+
+    def test_default_is_the_2_1_schedule(self):
+        from app.vjepa_3.models.utils.modules import Lambda_LinearWarmupHold
+
+        sched = Lambda_LinearWarmupHold(lambda_value=0.5)
+        self.assertEqual((sched.start, sched.end), (15_000, 30_000))
+        source = TRAIN_PY.read_text()
+        self.assertIn('cfgs_opt.get("lambda_warmup_frac", None)', source)
+        for path in _baseline_configs():
+            if path == PROXY_BASE:
+                continue
+            cfg = yaml.safe_load(path.read_text())
+            with self.subTest(config=str(path.relative_to(REPO_ROOT))):
+                self.assertNotIn("lambda_warmup_frac", cfg["optimization"])
+
+    def test_paper_fractions_reproduce_the_paper_iterations(self):
+        from app.vjepa_3.utils import lambda_warmup_iters
+
+        self.assertEqual(lambda_warmup_iters([0.05, 0.1], 300_000), (15_000, 30_000))
+        self.assertEqual(lambda_warmup_iters([0.05, 0.1], 9_000), (450, 900))
+        for bad in ([0.1], [0.2, 0.1], [0.1, 0.1], [-0.1, 0.5], [0.5, 1.5]):
+            with self.subTest(frac=bad), self.assertRaises(ValueError):
+                lambda_warmup_iters(bad, 9_000)
+
+    def test_proxy_run_spends_most_of_its_length_at_full_weight(self):
+        from app.vjepa_3.utils import lambda_warmup_iters
+
+        opt = yaml.safe_load(PROXY_BASE.read_text())["optimization"]
+        total = opt["epochs"] * opt["ipe"]
+        self.assertIn("lambda_warmup_frac", opt, "proxy would use 15,000 -> 30,000")
+        _, end = lambda_warmup_iters(opt["lambda_warmup_frac"], total)
+        self.assertLessEqual(end, 0.25 * total)
+        # ...and without the key this run would never reach full weight.
+        self.assertLess(total, 30_000)
 
 
 class TestAblationLadder(unittest.TestCase):

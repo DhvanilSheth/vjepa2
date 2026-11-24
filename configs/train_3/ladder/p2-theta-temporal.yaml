@@ -25,15 +25,26 @@
 #     disjoint ranks, so joint training needs >= 2 GPUs (train.py raises a
 #     clear error otherwise);
 #   * one dataset instead of three;
-#   * the isotropy diagnostic is switched on (measurement only).
+#   * the isotropy diagnostic is switched on (measurement only);
+#   * the settings tagged SCREEN below.
 #
-# UNTUNED: every value tagged UNTUNED below is a placeholder.  train.py has not
-# been run end to end on this machine, so batch size, schedule length and
-# learning rate were NOT measured.  Set batch_size from peak memory on the
-# first run, then pick epochs/ipe from the measured it/s and your time budget.
-# The paper recipe used a total batch of 64 GPUs x 48 clips; lr / ema / weight
-# decay below are copied from it unchanged and will likely need retuning for a
-# batch this much smaller.  Whatever you choose, keep it IDENTICAL across arms.
+# SCREEN: values set for a short exploratory ("screening") run on one Quadro
+# RTX 8000 (48 GB), from measurements on that card (Nov 2026):
+#   * dtype float16: that card runs bfloat16 ~9x slower than float16
+#     (7.6 s vs 1.7 s per step here).  On an Ampere-or-newer card use bfloat16.
+#   * use_activation_checkpointing false: checkpointing recomputes a forward
+#     pass to save memory; this recipe peaks at 7.8 GB with it on, so the
+#     memory is not needed.  Same gradients either way.
+#   * epochs 30 x ipe 300 = 9,000 iterations (the paper recipe is 300,000).
+#     Short on purpose: it ranks arms, it does not produce a final model.
+#     Confirm any winner with a longer run.
+#   * lambda_warmup_frac [0.05, 0.1]: the context-loss warm-up at the same
+#     FRACTION of the run as the paper recipe.  Without it V-JEPA 2.1's fixed
+#     15,000 -> 30,000 iterations would leave the context loss off for this
+#     entire run.
+#   * lr 2e-4: NOT tuned.  The paper's 6e-4 is for a total batch of 3,072;
+#     2e-4 is the highest value a test run at batch 16 was observed stable at.
+# Whatever you change, keep it IDENTICAL across arms.
 app: vjepa_3
 nodes: 1
 tasks_per_node: 1
@@ -46,14 +57,14 @@ data:
   - /your_data/ssv2_train_paths.csv
   datasets_weights:
   - 1.0
-  batch_size: 16          # UNTUNED
+  batch_size: 16          # SCREEN (GPU is compute-bound; a larger batch is not faster)
   crop_size: 256
   patch_size: 16
   dataset_fpcs:
   - 16
   tubelet_size: 2
   fps: 4
-  num_workers: 8
+  num_workers: 24         # SCREEN (8 left the GPU waiting on video decode)
   persistent_workers: true
   pin_mem: true
 data_aug:
@@ -100,10 +111,10 @@ mask:
   - 1.0
   - 1.0
 meta:
-  dtype: bfloat16
+  dtype: float16          # SCREEN
   load_checkpoint: true
   read_checkpoint: null
-  save_every_freq: 50
+  save_every_freq: 10     # SCREEN (epochs 10/20/30 are kept, to check a ranking is stable)
   seed: 239
   use_sdpa: true
   # Isotropy reading every 100 iterations -> <folder>/diag_r0.csv.
@@ -167,7 +178,7 @@ model:
   pred_is_causal: false
   pred_num_heads: 12
   uniform_power: true
-  use_activation_checkpointing: true
+  use_activation_checkpointing: false   # SCREEN
   use_mask_tokens: true
   use_rope: true
   zero_init_mask_tokens: true
@@ -175,12 +186,15 @@ optimization:
   ema:
   - 0.99925
   - 0.99925
-  epochs: 100             # UNTUNED
-  final_lr: 0.0006        # UNTUNED (paper value, total batch 3072)
+  epochs: 30              # SCREEN
+  final_lr: 0.0002        # SCREEN
   final_weight_decay: 0.04
   ipe: 300
   ipe_scale: 1.25
-  lr: 0.0006              # UNTUNED (paper value, total batch 3072)
-  start_lr: 0.0001        # UNTUNED
-  warmup: 10              # UNTUNED
+  lambda_warmup_frac:     # SCREEN
+  - 0.05
+  - 0.1
+  lr: 0.0002              # SCREEN
+  start_lr: 0.0001
+  warmup: 3               # SCREEN (10% of the run; the paper recipe uses 4%)
   weight_decay: 0.04

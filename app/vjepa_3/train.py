@@ -28,6 +28,7 @@ from app.vjepa_3.transforms import make_transforms
 from app.vjepa_3.utils import (
     init_opt,
     init_video_model,
+    lambda_warmup_iters,
     load_checkpoint,
     normalize_nested,
 )
@@ -235,6 +236,13 @@ def main(args, resume_preempt=False):
     wd = float(cfgs_opt.get("weight_decay"))
     final_wd = float(cfgs_opt.get("final_weight_decay"))
     num_epochs = cfgs_opt.get("epochs")
+    # -- V-JEPA 3: warm-up of the context ("dense") loss weight, as two
+    #    FRACTIONS of the run: [start, end].  V-JEPA 2.1 hard-codes iterations
+    #    15,000 -> 30,000 (modules.py: Lambda_LinearWarmupHold), which is 5% ->
+    #    10% of its 300,000-iteration recipe.  On a short run those absolute
+    #    numbers land late or never: a 30,000-iteration run reaches full
+    #    weight only on its last step.  null => the 2.1 iterations, unchanged.
+    lambda_warmup_frac = cfgs_opt.get("lambda_warmup_frac", None)
     warmup = cfgs_opt.get("warmup")
     start_lr = cfgs_opt.get("start_lr")
     lr = cfgs_opt.get("lr")
@@ -538,7 +546,19 @@ def main(args, resume_preempt=False):
         ema[0] + i * (ema[1] - ema[0]) / (ipe * num_epochs * ipe_scale)
         for i in range(int(ipe * num_epochs) + 1)
     )
-    lambda_sched = Lambda_LinearWarmupHold(lambda_value=lambda_value)
+    if lambda_warmup_frac is None:
+        lambda_sched = Lambda_LinearWarmupHold(lambda_value=lambda_value)
+    else:
+        lambda_start, lambda_end = lambda_warmup_iters(
+            lambda_warmup_frac, total_iters=ipe * num_epochs
+        )
+        lambda_sched = Lambda_LinearWarmupHold(
+            lambda_value=lambda_value, start_iter=lambda_start, end_iter=lambda_end
+        )
+    logger.info(
+        f"context-loss weight {lambda_value}: 0 until iteration {lambda_sched.start}, "
+        f"full from {lambda_sched.end} (run length {ipe * num_epochs})"
+    )
 
     start_epoch = 0
     # -- load training checkpoint

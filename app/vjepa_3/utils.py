@@ -441,3 +441,19 @@ def init_opt(
 
     scaler = torch.amp.GradScaler() if mixed_precision else None
     return optimizer, scaler, scheduler, wd_scheduler
+
+
+def lambda_warmup_iters(frac, total_iters):
+    """[start, end] fractions of a run -> (start_iter, end_iter) for the
+    context-loss warm-up.  See `optimization.lambda_warmup_frac` in train.py.
+    """
+    if len(frac) != 2:
+        raise ValueError(f"lambda_warmup_frac must be [start, end], got {frac}")
+    start_frac, end_frac = float(frac[0]), float(frac[1])
+    if not 0.0 <= start_frac < end_frac <= 1.0:
+        raise ValueError(
+            f"lambda_warmup_frac must satisfy 0 <= start < end <= 1, got {frac}"
+        )
+    start_iter = int(round(start_frac * total_iters))
+    end_iter = max(int(round(end_frac * total_iters)), start_iter + 1)
+    return start_iter, end_iter

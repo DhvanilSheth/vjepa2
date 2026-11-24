@@ -215,6 +215,9 @@ model:
   norm_out_type: null                # output norms only; follows norm_type
 meta:
   sigreg_diag_freq: 0                # isotropy reading every N iters; 0 = off (§9.3)
+optimization:
+  lambda_warmup_frac: null           # [start, end] fractions of the run; null = 2.1's
+                                     # fixed 15,000 -> 30,000 iterations (§6, §9.5)
 ```
 
 `null` on the four new `model:` keys means "V-JEPA 2.1 behaviour" and takes the
@@ -278,6 +281,7 @@ hop is missed, the knob stops moving the output and the test fails.
 | With `img_data` set and one rank, `int(world_size * img_rank_ratio)` is 0 and `img_total_batch_size % img_world_size` raises a bare `ZeroDivisionError` — so the stock configs cannot start on a single GPU. | **FIXED (message only)** — a `ValueError` explains that images and video train on disjoint ranks and points at the video-only proxy config. Joint training on one GPU is still not supported. |
 | `n_registers` creates **no register tokens** anywhere (no parameter, no concatenation). It only tells RoPE to leave the last `n` tokens unrotated — and on the encoder the rotary table is still built for the full grid, so `n_registers > 0` raises a shape error in the forward pass. | **DOCUMENTED, not fixed** — pinned by `TestRegistersAreNotImplemented` on both trees. Do not use it as an ablation arm; real registers would be new work (§7). |
 | `_rescale_blocks` divides `mlp.fc2.weight` by `sqrt(2·layer)`. For the MLP that is the output projection; for `SwiGLUFFN` `fc2` is the *gate-input* projection and the output (`fc3`) is left unscaled. | Carried over unchanged so `ffn_type: swiglu` stays bitwise equal to 2.1's `use_silu`. All GLU arms share it, so they remain comparable to each other; it is a confound when comparing GLU against the MLP arms. |
+| The context ("dense") loss weight warms up between **fixed** iterations 15,000 and 30,000 (`Lambda_LinearWarmupHold` defaults; no config key). That is 5%–10% of the 300,000-iteration paper recipe, but on a short run it lands late or never: a 30,000-iteration run reaches full weight on its last step, a 9,000-iteration run trains with the context loss off throughout. | **FIXED (opt-in)** — `optimization.lambda_warmup_frac: [0.05, 0.1]` places the warm-up at the same fraction of any run length. Unset, the 2.1 iterations are used unchanged. The proxy base sets it; `TestContextLossWarmup` fails if it is removed. `train.py` logs the resolved iterations at start-up. |
 | `meta: eval_freq` is in every config and read by nothing. | Carried over; listed in `KNOWN_DEAD_META_KEYS` so the meta-key test still catches new orphans. |
 
 ---
@@ -506,10 +510,15 @@ Rules for reading the results:
    compute a different function. Compare warm-started arms against a
    warm-started control and from-scratch arms against a from-scratch control.
    Never across.
-2. **Tune the base once, then freeze it.** Every value marked `UNTUNED` in the
-   base is a placeholder (nothing was measured on your GPU). Set them from the
-   first run's memory and speed, regenerate, and do not change them between
-   arms.
+2. **The base is a screening recipe; freeze it across arms.** Values marked
+   `SCREEN` in the base were set from measurements on one Quadro RTX 8000
+   (its header lists each one and why): `float16`, activation checkpointing
+   off, 30 epochs (9,000 iterations, ~3.5 h per arm), `lambda_warmup_frac`
+   so the context loss is on for 90% of the run, and an untuned `lr` of
+   2e-4. A 9,000-iteration run ranks arms; it can under-rate a change that
+   only pays off late, so checkpoints are kept at epochs 10/20/30 to see
+   whether a ranking is stable, and a winner is confirmed with a longer run
+   before it goes into the preset.
 3. **One seed is one sample.** On short proxy runs, differences of the size
    reported in the papers above (a few tenths of a point) are well inside
    seed noise. Re-run the control with a second seed before believing any
