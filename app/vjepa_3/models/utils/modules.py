@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from timm.models.layers import drop_path
+from timm.layers import drop_path
 
 from app.vjepa_3.models.utils.ffn import GLU_GATES, MLP_ACTS
 from app.vjepa_3.models.utils.string import apply_string
@@ -483,11 +483,10 @@ class RoPEAttention(nn.Module):
             k = torch.cat([kd, kh, kw], dim=-1)
 
         if self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
-                x = F.scaled_dot_product_attention(
-                    q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal
-                )
-                attn = None
+            x = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal
+            )
+            attn = None
         else:
             attn = (q @ k.transpose(-2, -1)) * self.scale
             attn = attn.softmax(dim=-1)
@@ -536,11 +535,10 @@ class Attention(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]
 
         if self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
-                x = F.scaled_dot_product_attention(
-                    q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal
-                )
-                attn = None
+            x = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=self.proj_drop_prob, is_causal=self.is_causal
+            )
+            attn = None
         else:
             attn = (q @ k.transpose(-2, -1)) * self.scale
             attn = attn.softmax(dim=-1)
@@ -710,8 +708,7 @@ class CrossAttention(nn.Module):
         k, v = kv[0], kv[1]
 
         if self.use_sdpa:
-            with torch.backends.cuda.sdp_kernel():
-                q = F.scaled_dot_product_attention(q, k, v)
+            q = F.scaled_dot_product_attention(q, k, v)
         else:
             xattn = (q @ k.transpose(-2, -1)) * self.scale
             xattn = xattn.softmax(dim=-1)

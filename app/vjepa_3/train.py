@@ -782,7 +782,7 @@ def main(args, resume_preempt=False):
                             return loss
 
                 # Step 1. Forward
-                with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
+                with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
                     h = forward_target(clips)
                     z_pred, z_context = forward_context(clips)
                     loss = 0
@@ -854,7 +854,7 @@ def main(args, resume_preempt=False):
                     torch._foreach_add_(params_k, params_q, alpha=1 - m)
 
                 return (
-                    float(loss),
+                    float(loss.detach()),
                     _new_lr,
                     _new_wd,
                     run_step,
