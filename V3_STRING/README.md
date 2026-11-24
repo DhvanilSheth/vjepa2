@@ -107,6 +107,8 @@ Outside `app/vjepa_3/`:
 |---|---|
 | `evals/feature_clustering_frozen/` | **NEW** — frozen-feature clustering probe: `cluster.py` (k-means, e-means adapter), `metrics.py`, `eval.py` (§9.4) |
 | `configs/eval_3/vitb16/cluster-probe.yaml` | config for that probe |
+| `evals/video_tracking_frozen/` | **NEW** — frozen-feature object-tracking probe on DAVIS 2017: `propagate.py` (label propagation), `metrics.py` (J and F), `davis.py` (dataset reader), `eval.py` (§9.6) |
+| `configs/eval_3/vitb16/davis-tracking.yaml` | config for that probe |
 | `configs/train_3/proxy/base-1gpu.yaml` | single-GPU, video-only base recipe (§9.5) |
 | `configs/train_3/ladder/*.yaml` | **GENERATED** ablation arms — do not edit |
 | `scripts/make_ladder_configs.py` | the generator, and the `ARMS` table that defines the ladder |
@@ -350,6 +352,7 @@ exactly. Do not widen it.
 | `test_vjepa3_norms.py` | DyT/Derf closed forms and published inits; inits survive `_init_weights`; every norm is replaced and `norm_out_type` is independent; `layernorm` ≡ default bitwise; fp32 under bf16 autocast; `alpha`/`shift` are never weight-decayed |
 | `test_vjepa3_compose.py` | every pair of flag families trains; with all on, every parameter gets a gradient; activation checkpointing agrees with the plain path |
 | `test_vjepa3_diagnostics.py` | equals LeJEPA Algorithm 1; Gaussian sits at the floor for any N; collapsed / mis-scaled / shifted / low-rank / heavy-tailed inputs score ≥ 20× the floor; immune to autocast |
+| `tests/probes/test_tracking_probe.py` | J and F against closed-form cases; label propagation tracks a synthetic object and loses it when the features carry no signal; frame/clip feature extraction keeps token order; `main()` end to end on a synthetic DAVIS-layout folder with a saved checkpoint, and a mismatched checkpoint is refused |
 | `tests/probes/test_cluster_probe.py` | purity and NMI against hand-computed values; k-means recovers separated blobs; the probe passes exactly the encoder kwargs the training path does; checkpoints load `strict=True` and a mismatched architecture is refused |
 | `test_vjepa3_ddp_static_graph.py` | STRING — alone, and combined with SwiGLU + Derf + per-axis RoPE base in training mode — trains across a T=1 rank and a T=8 rank under `static_graph=True`, **with a negative control that must fail** |
 
@@ -529,3 +532,39 @@ Rules for reading the results:
 
 There is no registers arm: see `n_registers` in §6.
 
+### 9.6 The tracking probe (`evals/video_tracking_frozen`)
+
+The reading the ladder is ranked by. The objects of a DAVIS 2017 validation
+video are outlined in its first frame; the probe tracks them through the
+video using only the similarity of frozen patch features between frames
+(label propagation, Jabri et al. 2020). Nothing is trained. The score is
+**J&F-Mean**: mask overlap (J) and outline accuracy (F), averaged over every
+object of the 30 videos.
+
+```bash
+python -m evals.video_tracking_frozen.eval --run <run folder> --davis <DAVIS root>
+python -m evals.video_tracking_frozen.eval --run <run folder> --davis <DAVIS root> --mode clip
+python -m evals.video_tracking_frozen.eval --run <run folder> --davis <DAVIS root> --random-init
+```
+
+- **Protocol** is V-JEPA 2.1's (paper §7, §C.3): short side 480 px, 15
+  context frames, circle neighbourhood of radius 12, top-5, temperature 0.2.
+  The paper reports 67.0 for its distilled ViT-B. A 9,000-iteration proxy run
+  will be far below that; use the probe to rank arms trained identically.
+- **`--random-init`** scores an untrained encoder of the same architecture.
+  Label propagation gets some overlap from the spatial neighbourhood alone,
+  so this is the floor a trained arm has to beat. Run it once per arm family.
+- **`--mode frame`** (default) feeds each frame alone, repeated to fill one
+  tubelet. **`--mode clip`** feeds 16-frame windows as in training, so the
+  temporal position encoding is exercised, at the cost of one feature map per
+  two frames. Report both for the positional arms (`p1`–`p3`): in `frame`
+  mode every token sits at temporal position 0.
+- The report also splits objects into small / medium / large by the share of
+  the first frame they cover (below 1%, 1–5%, above 5%). That split is ours,
+  not DAVIS's.
+- It reads the architecture from the run's `params-pretrain.yaml` and loads
+  `target_encoder` with `strict=True`, like the clustering probe.
+- **Not yet done:** a run on the real DAVIS set or a trained checkpoint, and
+  a cross-check of J and F against the official `davis2017-evaluation`
+  toolkit. The metric code follows the toolkit's definitions and is tested on
+  closed-form cases only.

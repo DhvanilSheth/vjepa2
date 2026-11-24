@@ -1,0 +1,39 @@
+# V-JEPA 3 frozen-feature tracking probe (evals/video_tracking_frozen).
+# Single GPU, either of:
+#   python -m evals.video_tracking_frozen.eval --run <run folder> --davis <DAVIS root>
+#   python -m evals.main --fname configs/eval_3/vitb16/davis-tracking.yaml --devices cuda:0
+#
+# The encoder architecture is NOT described here.  It is read from
+# <folder>/params-pretrain.yaml, the copy of the training config that
+# app/main.py writes into the run folder, so the probe always rebuilds the
+# model that produced the checkpoint.
+eval_name: video_tracking_frozen
+tag: davis-tracking
+# Run folder of the pre-training job (its `folder:` key).
+folder: /your_folder/pretrain_3/ladder/a0-control
+checkpoint: latest.pth.tar
+# target_encoder = the EMA weights, which is what V-JEPA evaluates.
+checkpoint_key: target_encoder
+# true => score an UNTRAINED encoder of the same architecture (the probe's floor).
+random_init: false
+experiment:
+  # frame | clip -- see the docstring of evals/video_tracking_frozen/eval.py.
+  feature_mode: frame
+  batch_size: 8
+  # float32 | float16 | bfloat16.  float32 is exact and fast enough here.
+  dtype: float32
+  data:
+    # Folder containing JPEGImages/, Annotations/ and ImageSets/.
+    davis_root: /your_data/DAVIS
+    split: val
+    short_side: 480
+    # clip mode only
+    frames_per_clip: 16
+  # V-JEPA 2.1's reported DAVIS configuration (paper Section 7).
+  propagation:
+    n_context: 15
+    neighborhood_size: 12
+    neighborhood_shape: circle
+    topk: 5
+    temperature: 0.2
+    normalize_labels: true
