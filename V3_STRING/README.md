@@ -105,6 +105,7 @@ diff -r app/vjepa_2_1 app/vjepa_3 -x '__pycache__'
 | `diagnostics.py` | **NEW** — SIGReg / Epps-Pulley isotropy reading (§9.3) |
 | `regularizers.py` | **NEW** — SIGReg and VISReg as optional loss terms on the encoder's tokens (§9.7) |
 | `pretrained.py` | **NEW** — loading a released V-JEPA 2.1 encoder; what can and cannot be carried over (§9.8) |
+| `masks.py` | **NEW** — two options on a `mask:` entry: hide whole time-steps, and cut token lists at random instead of from the end of the clip (§9.10) |
 | `train.py` | 10 new `cfgs_model.get`, 3 new `cfgs_meta.get`; `EMBED_DIM_BY_MODEL_NAME` (§6); the diagnostic hook; single-rank guard (§6); the regulariser term (§9.7); encoder warm start, freeze and lr scale (§9.8); gradient clipping; atomic checkpoints and `persistent_workers` (§6) |
 | `utils.py` | 10 new `init_video_model` params; `init_opt` weight-decay exclusion (§4.3) |
 | `wrappers.py`, `transforms.py`, `patch_embed.py`, `pos_embs.py`, `masks_dist.py` | unchanged copies |
@@ -234,7 +235,12 @@ loss:
   reg_weight: 0.0                    # must be > 0 when reg_type is set
   reg_num_slices: 1024               # random 1-D projections per step
   reg_max_tokens: 4096               # tokens sampled per step
+mask:                                # per entry of the list              (§9.10)
+- hide_time_steps: 0                 # k > 0: hide k whole time-steps instead of blocks
+  truncation: tail                   # random: use the whole clip evenly
+  max_temporal_keep: 1.0             # 2.1 key; < 1: context from the start of the clip only
 data:
+  fps: 4                             # 2.1 key; frames sampled per second
   persistent_workers: false          # read since Nov 2026 (§6); 2.1 ignored it
 meta:
   sigreg_diag_freq: 0                # isotropy reading every N iters; 0 = off (§9.3)
@@ -375,7 +381,7 @@ python3 -m pytest tests/ -q
 python3 scripts/make_ladder_configs.py --check
 ```
 
-243 pass, 4 skip (3 CUDA-gated, 1 needs Faiss ≥ 1.16). CPU only, about 90 s
+259 pass, 4 skip (3 CUDA-gated, 1 needs Faiss ≥ 1.16). CPU only, about 100 s
 (40 s of that is one test: the v3 loop against the 2.1 loop on ViT-L).
 
 `vit_tiny` is `embed_dim=192 / num_heads=3 ⇒ head_dim=64` — the **same**
@@ -398,6 +404,7 @@ exactly. Do not widen it.
 | `test_vjepa3_regularizers.py` | SIGReg equals the logged reading divided by N; VISReg equals the paper's listing; each term responds to its own failure (scale, centre, heavy tails); the stop-gradient on the scale is present; gradients are finite under exact collapse; half-configured settings raise |
 | `test_vjepa3_pretrained.py` | the architecture built for a released ViT-B equals the one Meta's loader builds (158 tensors); the warm-start arms build it too and the FFN/norm arms do not; loading is strict and `weights_only` |
 | `tests/train/test_vjepa3_train_loop.py` | the real `train.main()`: defaults ≡ the 2.1 loop bitwise; each regulariser trains, is logged, and touches only the encoder; warm start, freeze, lr scale and resume; gradient clipping; atomic checkpoints and a fatal failed final save; `persistent_workers` reaches the loader |
+| `test_vjepa3_masks.py` | default configs get 2.1's own collator, and the v3 generator at defaults reproduces it exactly; a random cut keeps the budget, stays sorted, never shows a hidden position, and evens out the time-steps; whole-time-step masks hide exactly k steps, differently per clip |
 | `tests/train/test_launcher.py` | `app/main.py` exits non-zero when a rank crashes |
 | `tests/scripts/test_ladder_tools.py` | the comparison tool resamples by video and needs both noise sources cleared before calling an arm "clear"; the pre-flight check flags `n1-dyt` and passes healthy arms |
 | `test_vjepa3_ddp_static_graph.py` | STRING — alone, and combined with SwiGLU + Derf + per-axis RoPE base in training mode — trains across a T=1 rank and a T=8 rank under `static_graph=True`, **with a negative control that must fail** |
@@ -550,8 +557,16 @@ arm from it; its `ARMS` table is the definition of the ladder.
 | `n2-derf` | `norm_type: derf` | **no** | `a0-control` |
 | `s1-sigreg` | `loss.reg_type: sigreg`, `reg_weight: 0.1` | yes | `a0-control` |
 | `s2-visreg` | `loss.reg_type: visreg`, `reg_weight: 0.05` | yes | `a0-control` |
+| `t1-future` | `mask.0.max_temporal_keep: 0.5` (§9.10) | yes | `a0-control` |
+| `t2-fps12` | `data.fps: 12` (§9.10) | yes | `a0-control` |
+| `t3-frames` | `mask.0.hide_time_steps: 6` (§9.10) | yes | `a0-control` |
+| `t4-whole-clip` | `truncation: random` on both masks (§9.10) | yes | `a0-control` |
 | `w0-warm-control` | released ViT-B encoder, 900 frozen iterations, encoder lr ×0.1 | yes | – |
 | `w2-warm-theta-temporal` | `w0` + `rope_theta: [100, 10000, 10000]` | yes | `w0-warm-control` |
+| `w3-warm-future` | `w0` + `mask.0.max_temporal_keep: 0.5` | yes | `w0-warm-control` |
+| `w4-warm-fps12` | `w0` + `data.fps: 12` | yes | `w0-warm-control` |
+| `w5-warm-frames` | `w0` + `mask.0.hide_time_steps: 6` | yes | `w0-warm-control` |
+| `w6-warm-whole-clip` | `w0` + `truncation: random` on both masks | yes | `w0-warm-control` |
 
 "Loadable" says the arm keeps the encoder's parameters. Only the `w` arms
 actually start from a released file; every other arm trains from scratch.
@@ -731,3 +746,74 @@ prints each arm's tracking score against the control with a 95% range from
 resampling the 30 test videos, and the gap between the two controls as the
 training-noise yardstick. An arm is marked "clear" only when its range
 excludes zero **and** its difference exceeds that gap.
+
+### 9.10 Time-focused arms: what is hidden, and how video is sampled
+
+These two change no network code. They change the task and the input, which
+is where the objective and the goal (following things through time) part ways.
+
+**What the recipe does today**, measured on the real mask generator at the
+recipe's size (16 frames = 8 time-steps of 256 tokens, batch 16; share of each
+time-step's tokens, averaged over 3,200 clips):
+
+| | step 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+|---|---|---|---|---|---|---|---|---|
+| mask 0, visible to the encoder | 39% | 39% | 38% | 36% | 29% | 16% | 7% | 3% |
+| mask 0, prediction target | 61% | 61% | 61% | 61% | 60% | 49% | 24% | 7% |
+| mask 1, visible to the encoder | 19% | 16% | 10% | 6% | 3% | 2% | 1% | 1% |
+| mask 1, prediction target | 81% | 81% | 81% | 81% | 81% | 80% | 61% | 20% |
+
+Two things follow:
+
+1. **The same spatial blocks are hidden in every frame** (`temporal_scale:
+   [1.0, 1.0]`), so the task is mostly "fill in space"; nothing requires
+   following an object from one frame to the next.
+2. **The end of every clip is largely unused**: 26% (mask 0) and 22% (mask 1)
+   of all tokens are neither shown nor asked about, almost all of them in the
+   last two time-steps. The generator cuts every token list in a batch to the
+   length of the shortest one, and the lists are sorted by time, so the cut
+   always removes the latest tokens. This is upstream behaviour
+   (`src/masks/multiseq_multiblock3d.py`, frozen here), present in V-JEPA 2.1
+   as released; a larger batch makes the cut deeper. `t4-whole-clip` changes
+   it.
+
+**`t1-future`** sets `max_temporal_keep: 0.5` on mask 0 only: its context
+comes from the first four time-steps and the predictor must produce the later
+ones (targets per time-step become 61 / 61 / 61 / 61 / 100 / 100 / 99 / 48%).
+Mask 1 is unchanged, so the encoder still sees every time position. The risk:
+Meta hides the same region in all frames precisely so the model cannot copy
+from a neighbouring frame; predicting the future of a static scene is easy,
+and an easy task teaches little.
+
+**`t2-fps12`** samples frames at 12 per second instead of 4, so 16 frames
+span 1.3 s instead of 4 s. The tracking test runs on consecutive 24-fps
+frames; at 4 fps the model never trains on displacements that small. The
+cost: less long-range context per clip. Note the pre-flight check cannot see
+this arm (its synthetic clips have no frame rate).
+
+**`t3-frames`** hides whole moments instead of regions. For mask 0, six of
+the eight time-steps, chosen at random per clip, are hidden completely and
+predicted from the two that are shown (`hide_time_steps: 6`,
+`app/vjepa_3/masks.py`). The idea: a video is a set of samples of a continuous
+world, so ask the model for the moments it was not given. Six was chosen to
+match the control's budget: two visible time-steps are 512 tokens and the
+control's mask 0 shows about 504, so the arm changes how the visible quarter
+is arranged, not how much is shown. Per time-step it shows 25% and asks about
+75%, evenly, with nothing unused. Known risks: Meta and VideoMAE chose against
+frame masking because neighbouring frames are similar enough to copy from; and
+one time-step is two frames, so frames are hidden in pairs. This is the
+settings-only half of the idea. The other half (time positions in seconds, and
+several frame rates, so the model can be asked about in-between moments) is
+not built.
+
+**`t4-whole-clip`** fixes finding 2 above and nothing else: when a batch's
+token lists are cut to a common length, a random subset is kept instead of the
+first entries (`truncation: random` on both masks). The same number of tokens
+is shown and asked about; every time-step now gets the same share (mask 0: 26%
+shown and 48% asked in each step, against 39% → 3% and 61% → 7% from first
+step to last in the control).
+
+All four exist from scratch (`t1`–`t4`, against `a0-control`) and on the
+released encoder (`w3`–`w6`, against `w0-warm-control`). Read them in
+`--mode clip`: single-frame mode cannot see a change that is about time.
+

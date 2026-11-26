@@ -203,6 +203,38 @@ class TestWarmStart(TrainLoopCase):
         self.assertFalse(states_equal(bare(resumed["init_encoder"]), weights))
 
 
+class TestTimeFocusedArms(TrainLoopCase):
+    def test_future_prediction_mask_trains_through_the_real_loop(self):
+        """mask.0.max_temporal_keep < 1 changes what the encoder sees, so the
+        run must differ from the control and stay finite."""
+        cfg = self.cfg("future")
+        cfg["mask"][0]["max_temporal_keep"] = 0.5
+        out = run_train(cfg)
+        control = run_train(self.cfg("control"))
+        self.assertFalse(states_equal(out["latest"]["encoder"], control["latest"]["encoder"]))
+        for model in MODELS:
+            for value in out["latest"][model].values():
+                self.assertTrue(torch.isfinite(value).all())
+
+    def test_whole_frame_and_whole_clip_masks_train_through_the_real_loop(self):
+        """The tiny clip has 4 time-steps, so 2 are hidden here (the arm
+        hides 6 of 8).  Each option must change the run and keep it finite."""
+        control = run_train(self.cfg("control"))
+        for name, edit in (("frames", {"hide_time_steps": 2}), ("whole", {"truncation": "random"})):
+            cfg = self.cfg(name)
+            cfg["mask"][0].update(edit)
+            out = run_train(cfg)
+            with self.subTest(option=name):
+                self.assertFalse(states_equal(out["latest"]["encoder"], control["latest"]["encoder"]))
+                for model in MODELS:
+                    for value in out["latest"][model].values():
+                        self.assertTrue(torch.isfinite(value).all())
+
+    def test_fps_reaches_the_loader(self):
+        out = run_train(self.cfg("fps", epochs=1, ipe=1, data={"fps": 12}))
+        self.assertEqual(out["init_data_kwargs"]["fps"], 12)
+
+
 class TestClipGrad(TrainLoopCase):
     def _norms(self, name, **optimization):
         norms = []

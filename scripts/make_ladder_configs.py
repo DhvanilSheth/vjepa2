@@ -41,15 +41,18 @@ a preset built from guesses cannot be attributed to anything.
 OVERRIDE KEYS
 -------------
 A plain key ("rope_theta") is a `model:` key.  A dotted key
-("loss.reg_type") names its section.  Every key must already exist in the
-base file at its baseline value.
+("loss.reg_type") names its section.  A key with a number
+("mask.0.max_temporal_keep") names one entry of a list section, counted from
+0.  Every key must already exist in the base file at its baseline value.
 
-THREE FAMILIES
---------------
+FOUR FAMILIES
+-------------
   a / p / f / n   the first screen: architecture changes, from scratch,
                   compared with a0-control.
   s               regularisers added to the loss, from scratch, compared with
                   a0-control.
+  t               how the video is fed and what is hidden (time-focused),
+                  from scratch, compared with a0-control.
   w               encoder started from Meta's released V-JEPA 2.1 ViT-B
                   (app/vjepa_3/pretrained.py).  Compared with w0-warm-control,
                   NOT with a0-control: the starting point differs.
@@ -94,6 +97,40 @@ WARM_START = {
     "optimization.freeze_encoder_iters": 900,
     "optimization.encoder_lr_scale": 0.1,
 }
+
+# -- Time-focused changes to WHAT THE MODEL IS ASKED and HOW VIDEO IS SAMPLED.
+#    Neither touches the network, so both also exist in the warm-start family.
+#
+# FUTURE: the recipe has two masks per clip.  Both hide the same spatial
+# blocks in EVERY frame, so nothing in the task requires following an object
+# through time.  Here mask 0 (eight small blocks; about a quarter of the clip
+# stays visible) keeps its context to the first half of the clip: the encoder
+# sees frames 1-8 and the predictor must produce all of frames 9-16.  Mask 1
+# (two large blocks) is unchanged, so the encoder still sees every time
+# position in half of its passes.
+FUTURE = {"mask.0.max_temporal_keep": 0.5}
+#
+# FPS12: frames are taken 12 per second instead of 4, so the 16 frames span
+# 1.3 s instead of 4 s and neighbouring frames show small displacements.  The
+# tracking test runs on consecutive 24-fps frames; at 4 fps the model never
+# trains on motion that small.
+FPS12 = {"data.fps": 12}
+
+#
+# FRAMES: mask 0 hides whole moments instead of regions: 6 of the 8 time-steps,
+# chosen at random per clip, are hidden completely and predicted from the 2
+# that are shown (app/vjepa_3/masks.py).  6 was chosen to MATCH THE CONTROL'S
+# BUDGET: 2 visible time-steps are 512 tokens, the control's mask 0 shows
+# about 504.  So the arm changes how the visible quarter is arranged (two
+# whole frames against the same patches in every frame), not how much is
+# shown.  Mask 1 is unchanged.
+FRAMES = {"mask.0.hide_time_steps": 6}
+#
+# WHOLE_CLIP: both masks keep a random subset when a batch's token lists are
+# cut to a common length, instead of 2.1's cut from the end.  Same number of
+# tokens shown and asked about; they are spread over the whole clip instead
+# of leaving its last quarter largely unused.
+WHOLE_CLIP = {"mask.0.truncation": "random", "mask.1.truncation": "random"}
 
 # name -> (what it tests, can the encoder be loaded from a 2.1 checkpoint, overrides)
 ARMS = {
@@ -147,6 +184,26 @@ ARMS = {
         True,
         {"loss.reg_type": "visreg", "loss.reg_weight": VISREG_WEIGHT},
     ),
+    "t1-future": (
+        "Future prediction on mask 0: context from the first half of the clip only.",
+        True,
+        dict(FUTURE),
+    ),
+    "t2-fps12": (
+        "Frames sampled at 12 fps instead of 4 (16 frames span 1.3 s instead of 4 s).",
+        True,
+        dict(FPS12),
+    ),
+    "t3-frames": (
+        "Mask 0 hides 6 of 8 whole time-steps instead of spatial blocks.",
+        True,
+        dict(FRAMES),
+    ),
+    "t4-whole-clip": (
+        "Token lists are cut to a common length at random, not from the end of the clip.",
+        True,
+        dict(WHOLE_CLIP),
+    ),
     "w0-warm-control": (
         "Control of the warm-start family: released V-JEPA 2.1 ViT-B encoder, nothing else changed.",
         True,
@@ -156,6 +213,26 @@ ARMS = {
         "p2-theta-temporal on top of the released encoder. Compare with w0-warm-control.",
         True,
         dict(WARM_START, rope_theta=[100.0, 10000.0, 10000.0]),
+    ),
+    "w3-warm-future": (
+        "t1-future on top of the released encoder. Compare with w0-warm-control.",
+        True,
+        dict(WARM_START, **FUTURE),
+    ),
+    "w4-warm-fps12": (
+        "t2-fps12 on top of the released encoder. Compare with w0-warm-control.",
+        True,
+        dict(WARM_START, **FPS12),
+    ),
+    "w5-warm-frames": (
+        "t3-frames on top of the released encoder. Compare with w0-warm-control.",
+        True,
+        dict(WARM_START, **FRAMES),
+    ),
+    "w6-warm-whole-clip": (
+        "t4-whole-clip on top of the released encoder. Compare with w0-warm-control.",
+        True,
+        dict(WARM_START, **WHOLE_CLIP),
     ),
 }
 
@@ -187,6 +264,33 @@ def _set_key(text, section, key, value):
     return text[:start] + body + text[end:]
 
 
+def _set_list_key(text, section, index, key, value):
+    """Rewrite `key` inside entry `index` of the top-level list `section:`.
+
+    The list is block-style: each entry starts with "- " in column 0 and its
+    other keys are indented by two spaces.
+    """
+    start = text.index(f"\n{section}:\n") + len(section) + 3
+    match = re.compile(r"^[^\s-]", re.M).search(text, start)
+    end = match.start() if match else len(text)
+    body = text[start:end]
+    starts = [m.start() for m in re.finditer(r"^- ", body, re.M)]
+    if index >= len(starts):
+        raise KeyError(f"`{section}:` has {len(starts)} entries; there is no entry {index}")
+    stop = starts[index + 1] if index + 1 < len(starts) else len(body)
+    item = body[starts[index] : stop]
+    pattern = re.compile(rf"^(  |- ){re.escape(key)}:.*$", re.M)
+    hits = pattern.findall(item)
+    if len(hits) != 1:
+        raise KeyError(
+            f"expected exactly one `{key}:` line in entry {index} of `{section}:` "
+            f"in the base config, found {len(hits)}."
+        )
+    item = pattern.sub(lambda m: f"{m.group(1)}{key}: {_yaml_scalar(value)}", item)
+    body = body[: starts[index]] + item + body[stop:]
+    return text[:start] + body + text[end:]
+
+
 def _set_folder(text, name, folder_root):
     pattern = re.compile(r"^folder:.*$", re.M)
     assert len(pattern.findall(text)) == 1
@@ -194,9 +298,20 @@ def _set_folder(text, name, folder_root):
 
 
 def split_key(key):
-    """"loss.reg_type" -> ("loss", "reg_type"); a plain key is a `model:` key."""
-    section, _, name = key.rpartition(".")
-    return (section or "model"), name
+    """Override key -> (section, list index or None, key).
+
+    "rope_theta" -> ("model", None, "rope_theta");
+    "loss.reg_type" -> ("loss", None, "reg_type");
+    "mask.0.max_temporal_keep" -> ("mask", 0, "max_temporal_keep").
+    """
+    parts = key.split(".")
+    if len(parts) == 1:
+        return "model", None, parts[0]
+    if len(parts) == 2:
+        return parts[0], None, parts[1]
+    if len(parts) == 3 and parts[1].isdigit():
+        return parts[0], int(parts[1]), parts[2]
+    raise KeyError(f"cannot read override key {key!r}")
 
 
 def render(name, description, warm_start, overrides, local=None):
@@ -220,16 +335,21 @@ def render(name, description, warm_start, overrides, local=None):
         base_text = base_text.replace(DATA_PLACEHOLDER, local["data"])
     text = _set_folder(base_text, run_name, folder_root)
     for key, value in overrides.items():
-        section, plain = split_key(key)
-        text = _set_key(text, section, plain, value)
+        section, index, plain = split_key(key)
+        if index is None:
+            text = _set_key(text, section, plain, value)
+        else:
+            text = _set_list_key(text, section, index, plain, value)
 
     # The rewrite is textual (to keep the base file's comments); prove it did
     # exactly what the table says by comparing parsed configs.
     expected = yaml.safe_load(base_text)
     expected["folder"] = f"{folder_root}/{run_name}"
     for key, value in overrides.items():
-        section, plain = split_key(key)
-        expected[section][plain] = value
+        section, index, plain = split_key(key)
+        target = expected[section] if index is None else expected[section][index]
+        assert plain in target, f"{name}: `{key}` is not in the base config"
+        target[plain] = value
     assert yaml.safe_load(text) == expected, f"{name}: rendered config != base + overrides"
 
     changed = ", ".join(f"{k}: {_yaml_scalar(v)}" for k, v in overrides.items()) or "nothing"

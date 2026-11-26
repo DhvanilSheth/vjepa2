@@ -91,11 +91,21 @@ loss:
   reg_coeff: 0.0
   shift_by_n: 0
   weight_distance_loss: true
+# -- V-JEPA 3: two optional keys on each `mask:` entry (app/vjepa_3/masks.py).
+#    Both defaults give V-JEPA 2.1's masks, from 2.1's own code.
+#    hide_time_steps: 0 = spatial blocks hidden in every frame (2.1).  k > 0 =
+#      for this mask, hide k whole time-steps instead and predict them from
+#      the visible ones (one time-step is tubelet_size frames).
+#    truncation: tail = cut each batch's token lists to the shortest one from
+#      the END (2.1; leaves the end of every clip largely unused).  random =
+#      keep a random subset of the same size, so the whole clip is used.
 mask:
 - aspect_ratio:
   - 0.75
   - 1.5
   full_complement: false
+  hide_time_steps: 0
+  truncation: tail
   max_keep: null
   max_temporal_keep: 1.0
   num_blocks: 8
@@ -109,6 +119,8 @@ mask:
   - 0.75
   - 1.5
   full_complement: false
+  hide_time_steps: 0
+  truncation: tail
   max_keep: null
   max_temporal_keep: 1.0
   num_blocks: 2

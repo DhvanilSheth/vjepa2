@@ -69,6 +69,16 @@ V3_OTHER_DEFAULTS = {
     ("optimization", "encoder_lr_scale"): 1.0,
 }
 
+# Keys that exist in V-JEPA 2.1 and that the time-focused arms move: override
+# key -> the recipe's value.
+RECIPE_KEYS_ARMS_MAY_CHANGE = {
+    "data.fps": 4,
+    "mask.0.max_temporal_keep": 1.0,
+}
+
+# The two v3 keys on every `mask:` entry and the values that give 2.1's masks.
+V3_MASK_DEFAULTS = {"hide_time_steps": 0, "truncation": "tail"}
+
 # `loss:` keys present in the configs that nothing reads.  Inherited from
 # V-JEPA 2.1 (ladder audit C-17); listed so a NEW orphan is still caught.
 KNOWN_DEAD_LOSS_KEYS = {
@@ -213,6 +223,18 @@ class TestVJepa3ConfigKeysHaveReaders(unittest.TestCase):
                     self.assertIn(key, cfg[section], "missing")
                     self.assertEqual(cfg[section][key], default, "not at baseline")
 
+    def test_mask_entries_carry_the_v3_keys_at_baseline(self):
+        from app.vjepa_3.masks import uses_v3_masking
+
+        for path in _baseline_configs():
+            cfg = yaml.safe_load(path.read_text())
+            with self.subTest(config=str(path.relative_to(REPO_ROOT))):
+                for entry in cfg["mask"]:
+                    for key, default in V3_MASK_DEFAULTS.items():
+                        self.assertEqual(entry.get(key), default, key)
+                self.assertFalse(uses_v3_masking(cfg["mask"]))
+        self.assertIn("build_mask_collator(", TRAIN_PY.read_text())
+
     def test_baseline_configs_declare_no_orphan_from_2_1(self):
         """The dead 2.1 keys must not be carried into v3 configs.
 
@@ -334,6 +356,14 @@ class TestAblationLadder(unittest.TestCase):
         for section, value in cfg.items():
             if section == "folder":
                 continue
+            if isinstance(value, list) and value and isinstance(value[0], dict):
+                self.assertEqual(len(value), len(self.base[section]), section)
+                for index, (entry, base_entry) in enumerate(zip(value, self.base[section])):
+                    self.assertEqual(set(entry), set(base_entry), f"{section}[{index}]")
+                    for key, leaf in entry.items():
+                        if leaf != base_entry[key]:
+                            changed[f"{section}.{index}.{key}"] = leaf
+                continue
             if not isinstance(value, dict):
                 self.assertEqual(value, self.base[section], section)
                 continue
@@ -359,7 +389,14 @@ class TestAblationLadder(unittest.TestCase):
             self.assertEqual(self.base[section][key], default)
         overrides = [tuple(sorted(map(str, spec[2].items()))) for spec in arms.values()]
         self.assertEqual(len(set(overrides)), len(overrides), "two arms are identical")
-        allowed = set(V3_MODEL_DEFAULTS) | {f"{s}.{k}" for s, k in V3_OTHER_DEFAULTS}
+        self.assertEqual(self.base["data"]["fps"], RECIPE_KEYS_ARMS_MAY_CHANGE["data.fps"])
+        self.assertEqual(self.base["mask"][0]["max_temporal_keep"], 1.0)
+        allowed = (
+            set(V3_MODEL_DEFAULTS)
+            | {f"{s}.{k}" for s, k in V3_OTHER_DEFAULTS}
+            | set(RECIPE_KEYS_ARMS_MAY_CHANGE)
+            | {f"mask.{i}.{k}" for i in range(len(self.base["mask"])) for k in V3_MASK_DEFAULTS}
+        )
         for name, (_, _, changed) in arms.items():
             self.assertLessEqual(set(changed), allowed, name)
 
@@ -376,6 +413,55 @@ class TestAblationLadder(unittest.TestCase):
             else:
                 with self.subTest(arm=name):
                     self.assertFalse(set(changed) & set(control), "a from-scratch arm warm-starts")
+
+    def test_future_arm_hides_the_second_half_from_one_mask_only(self):
+        """What `mask.0.max_temporal_keep: 0.5` does, on the REAL mask
+        generator at the recipe's size (8 time-steps of 16 x 16 tokens).
+
+        Mask 0: every visible token lies in the first 4 time-steps, and most
+        of the last 4 are prediction targets (not all: the generator cuts
+        every list in a batch to the shortest one, from the END, so the tail
+        of the clip is under-represented -- see PROGRESS.md).  Mask 1 is
+        untouched and still shows the encoder both halves.  The control shows
+        both halves in both masks -- without that contrast this test would
+        pass for a key that did nothing.
+        """
+        from src.masks.multiseq_multiblock3d import MaskCollator
+
+        tokens_per_step, half = 16 * 16, 4 * 16 * 16
+
+        def masks(arm):
+            cfg = yaml.safe_load((LADDER_DIR / f"{arm}.yaml").read_text())
+            collator = MaskCollator(
+                cfgs_mask=cfg["mask"],
+                dataset_fpcs=cfg["data"]["dataset_fpcs"],
+                crop_size=cfg["data"]["crop_size"],
+                patch_size=cfg["data"]["patch_size"],
+                tubelet_size=cfg["data"]["tubelet_size"],
+            )
+            torch.manual_seed(0)
+            return [g(batch_size=4) for g in collator.mask_generators[16]]
+
+        (enc0, pred0), (enc1, pred1) = masks("t1-future")
+        self.assertLess(int(enc0.max()), half)
+        self.assertGreater(enc0.shape[1], tokens_per_step // 2)
+        for row in pred0:
+            self.assertGreaterEqual(int((row >= half).sum()), 3 * tokens_per_step)
+        self.assertGreaterEqual(int(enc1.max()), half)
+
+        (control_enc0, _), _ = masks("a0-control")
+        self.assertGreaterEqual(int(control_enc0.max()), half)
+        self.assertEqual(self._changed(yaml.safe_load((LADDER_DIR / "w3-warm-future.yaml").read_text()))["mask.0.max_temporal_keep"], 0.5)
+
+    def test_list_override_touches_one_entry_only(self):
+        script = self.script
+        text = script.render("x", "d", True, {"mask.1.num_blocks": 5})
+        cfg = yaml.safe_load(text)
+        self.assertEqual(cfg["mask"][1]["num_blocks"], 5)
+        self.assertEqual(cfg["mask"][0], self.base["mask"][0])
+        for bad in ("mask.2.num_blocks", "mask.0.no_such_key", "a.b.c.d"):
+            with self.subTest(key=bad), self.assertRaises(KeyError):
+                script.render("x", "d", True, {bad: 1})
 
     def test_local_copies_change_only_paths_and_seed(self):
         """--local writes a machine's real paths without touching anything else."""

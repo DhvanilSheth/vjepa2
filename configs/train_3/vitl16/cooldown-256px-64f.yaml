@@ -83,6 +83,8 @@ mask:
   - 0.75
   - 1.5
   full_complement: false
+  hide_time_steps: 0
+  truncation: tail
   max_keep: null
   max_temporal_keep: 1.0
   num_blocks: 8
@@ -96,6 +98,8 @@ mask:
   - 0.75
   - 1.5
   full_complement: false
+  hide_time_steps: 0
+  truncation: tail
   max_keep: null
   max_temporal_keep: 1.0
   num_blocks: 2

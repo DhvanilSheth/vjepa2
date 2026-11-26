@@ -35,7 +35,8 @@ The plan has four steps:
 | Second control run (training noise) | **running** (`a0-control-s2`, seed 1239) |
 | Tracking scores, 16-frame mode | **not started**; never run at full size on the GPU |
 | Ranking against noise | waiting on the two rows above |
-| Second round built: regularisers, released-encoder start, tools, fixes | done locally, 243 tests pass; **not committed, not yet on the server** |
+| Second round built: regularisers, released-encoder start, tools, fixes | done, pushed (`cbd11a0`) |
+| Time-focused arms (future prediction, 12 fps, whole-frame masks, whole-clip use), from scratch and on the released encoder | done, pushed; 259 tests pass |
 | Second round run | not started |
 | Combination and long confirming run | not started |
 
@@ -129,8 +130,16 @@ the default, the training loop still produces the same checkpoint as Meta's
 |---|---|---|
 | `s1-sigreg` | SIGReg (LeJEPA) added to the loss, on the encoder's patch tokens | `a0-control` |
 | `s2-visreg` | VISReg added the same way | `a0-control` |
+| `t1-future` | Future prediction: for one of the two masks, the encoder sees only the first half of the clip | `a0-control` |
+| `t2-fps12` | Frames 12 per second instead of 4 (smaller movements between frames) | `a0-control` |
+| `t3-frames` | Whole moments hidden instead of regions: 6 of 8 time-steps hidden and predicted from the other 2 | `a0-control` |
+| `t4-whole-clip` | The whole clip is used evenly, instead of mostly its first three quarters | `a0-control` |
 | `w0-warm-control` | Encoder started from Meta's released ViT-B; nothing else changed | – (it is a control) |
 | `w2-warm-theta-temporal` | Time-axis RoPE change on top of the released encoder | `w0-warm-control` |
+| `w3-warm-future` | `t1-future` on top of the released encoder | `w0-warm-control` |
+| `w4-warm-fps12` | `t2-fps12` on top of the released encoder | `w0-warm-control` |
+| `w5-warm-frames` | `t3-frames` on top of the released encoder | `w0-warm-control` |
+| `w6-warm-whole-clip` | `t4-whole-clip` on top of the released encoder | `w0-warm-control` |
 
 Points to keep in mind:
 
@@ -170,8 +179,8 @@ Points to keep in mind:
 
 **Verification**
 
-- 243 tests pass, 4 skipped (3 need a GPU, 1 needs Faiss).
-- 20 deliberate breakages of the new code were each caught by a test.
+- 259 tests pass, 4 skipped (3 need a GPU, 1 needs Faiss).
+- 31 deliberate breakages of the new code were each caught by a test.
 - Not verified: anything on the GPU or in float16 for the new paths; loading a
   real released file; `persistent_workers: true` on the server.
 
@@ -186,7 +195,52 @@ Points to keep in mind:
 | Exact resume (saving RNG state) | A resumed run differs only at the level of a different seed. |
 | Recipe changes for the long run (later context-loss ramp, EMA ramp; audit C-11, C-12) | Config-only (`lambda_warmup_frac`, `ema`); to be set when the long run is planned. |
 
-## 8. Next steps, in order
+## 8. Back to first principles (2026-11-26)
+
+What tracking needs from the encoder, against what training does today:
+
+| Need | Today | Gap |
+|---|---|---|
+| Features that separate objects | From scratch on 7,376 videos | Comes mostly from scale: we score 35, Meta's ViT-B 67 |
+| The same point keeps its feature over time | The same region is hidden in every frame | Nothing in the task requires following anything through time |
+| Small movements | Frames 0.25 s apart, two frames per token | The tracking test runs at 24 fps |
+| Small objects | 256 px, 16 px patches | Small objects score about 10, large about 50 |
+| A score that sees time | Single-frame mode | It measures still-image features |
+
+**A finding about how clips are fed** (README §9.10, measured on the real mask
+generator): the end of every clip is largely unused. About a quarter of all
+tokens are neither shown to the encoder nor asked about, nearly all in the
+last two of eight time-steps, because Meta's generator cuts each batch's token
+lists to the shortest one and always cuts from the end. In the last time-step
+the encoder sees 3% of the tokens and is asked about 7%. This is upstream
+behaviour, not something we introduced. `t4-whole-clip` changes it: it cuts
+at random instead of from the end, so every time-step gets the same share.
+
+**The continuous-time idea** (2026-11-26). A video is a set of samples of a
+continuous world, so the model should be asked for moments it was not given:
+hide whole frames and predict them from the frames around them, until it can
+describe any moment, including ones between recorded frames. `t3-frames` is
+the settings-only half of this (whole time-steps hidden). `t1-future` is the
+forward-only version. The other half is not built: time positions in seconds
+instead of frame counts, and several frame rates per video. It is worth
+building only if `t3-frames` or `t1-future` shows a gain in the 16-frame
+score. The model predicts features, not pixels; turning those into images
+would need a separate decoder.
+
+**Papers checked and set aside**
+
+| Paper | Why it does not apply |
+|---|---|
+| 2611.24778, Counterfactual World Models | Encoders are frozen; only a small action-conditioned predictor is trained, and the correction is applied at inference. Its "disturbance" is a hidden physical force, not noise in the video. No tracking, masking or frame-rate content. (Main body read; appendices not.) |
+| 2610.39302, Platonic Representation Hypothesis with JEPAs | Text and image alignment theory. Abstract only read. |
+
+**Not built: mixed frame rates and a real clock.** Sampling each video at
+several frame rates needs an addition to the data loader (one rate per run
+today), and it only makes sense with time positions in seconds: positions are
+frame counts today, so at mixed rates the same gap would mean different
+amounts of real time.
+
+## 9. Next steps, in order
 
 1. **Server:** let `a0-control-s2` finish, then score it in single-frame mode.
 2. **Server:** run 16-frame mode on `a0-control` as a memory check, then on
@@ -199,13 +253,17 @@ Points to keep in mind:
 6. **Server:** run `s1-sigreg` and `s2-visreg` (about 5 h each). Check
    `reg_r0.csv` after the first epoch.
 7. **Server:** run `w0-warm-control` and score it. Only if the score holds,
-   run `w2-warm-theta-temporal`.
+   run the time-focused arms on it, in this order: `w6-warm-whole-clip`,
+   `w5-warm-frames`, `w3-warm-future`, `w4-warm-fps12`, then
+   `w2-warm-theta-temporal`. If it does not hold, run the from-scratch twins
+   `t4-whole-clip`, `t3-frames`, `t1-future`, `t2-fps12` instead. Score all of
+   these in 16-frame mode.
 8. **Server, only if `f2-relu2` is still ahead after step 3:** repeat it with
    a second seed.
 9. Combine the winners (`PRESET` in `make_ladder_configs.py`) and do one long
    confirming run.
 
-## 9. Server reference
+## 10. Server reference
 
 | Item | Value |
 |---|---|

@@ -22,6 +22,7 @@ import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
 from app.vjepa_3.diagnostics import gaussian_floor, isotropy_report
+from app.vjepa_3.masks import build_mask_collator
 from app.vjepa_3.models.utils.masks_dist import compute_mask_distance
 from app.vjepa_3.models.utils.modules import Lambda_LinearWarmupHold
 from app.vjepa_3.pretrained import load_pretrained_encoder
@@ -35,7 +36,6 @@ from app.vjepa_3.utils import (
     normalize_nested,
 )
 from src.datasets.data_manager import init_data
-from src.masks.multiseq_multiblock3d import MaskCollator
 from src.masks.utils import apply_masks
 from src.utils.distributed import init_distributed
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
@@ -527,7 +527,9 @@ def main(args, resume_preempt=False):
         target_encoder.compile()
         predictor.compile()
 
-    mask_collator = MaskCollator(
+    # -- V-JEPA 3: V-JEPA 2.1's own MaskCollator unless a `mask:` entry sets
+    #    `truncation: random` or `hide_time_steps` (app/vjepa_3/masks.py).
+    mask_collator = build_mask_collator(
         cfgs_mask=cfgs_mask,
         dataset_fpcs=dataset_fpcs,
         crop_size=crop_size,
