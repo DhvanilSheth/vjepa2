@@ -64,6 +64,12 @@ img_mask:
   - 1.0
 
 loss:
+  # -- V-JEPA 3: optional regulariser (app/vjepa_3/regularizers.py).
+  #    reg_type: null | sigreg | visreg.  null => V-JEPA 2.1's loss.
+  reg_type: null
+  reg_weight: 0.0
+  reg_num_slices: 1024
+  reg_max_tokens: 4096
   computing_gram_loss: false
   gram_HighRes: false
   gram_ckpt: None
@@ -100,6 +106,9 @@ mask:
   - 1.0
   - 1.0
 meta:
+  # -- V-JEPA 3: encoder warm start (app/vjepa_3/pretrained.py).  null => off.
+  pretrained_encoder: null
+  pretrained_encoder_key: ema_encoder
   dtype: bfloat16
   eval_freq: 100
   load_checkpoint: true
@@ -168,6 +177,10 @@ model:
   use_rope: true
   zero_init_mask_tokens: true
 optimization:
+  # -- V-JEPA 3 (defaults = V-JEPA 2.1 behaviour); see train.py.
+  clip_grad: null
+  freeze_encoder_iters: 0
+  encoder_lr_scale: 1.0
   anneal_ckpt: /your_folder/pretrain_2_1/16.8.vitb.256px.16f/latest.pth.tar
   ema:
   - 0.99925

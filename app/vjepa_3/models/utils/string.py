@@ -15,9 +15,17 @@ WHY -- what this replaces
 V-JEPA 2.1's RoPEAttention hard-partitions every attention head: with
 head_dim=64 it sets d_dim = h_dim = w_dim = 20 (modules.py:253-255), so dims
 0-19 encode time, 20-39 height, 40-59 width, and the last 4 are unrotated.
-That partition is an arbitrary design choice -- nothing says the three axes
-should not share subspaces.  STRING relaxes it into a LEARNED basis while
-provably keeping translation invariance.
+That partition is an arbitrary design choice.  STRING puts a LEARNED basis in
+front of it while provably keeping translation invariance.
+
+WHAT THIS DOES NOT DO (ladder audit S-01, S-03).  P does not change WHICH
+rotations are applied: D(r) keeps its 10 + 10 + 10 frequency pairs, one axis
+each, so the three axes still occupy separate rotation planes and the set of
+frequencies is unchanged.  P only chooses which directions of q and k feed
+those planes -- and each layer's qkv projection can already do that: P folds
+exactly into the q and k weights.  With frozen frequencies, as here, the arm
+and the baseline can represent the same functions; what differs is how
+training moves through them.
 
 THE MATH -- why this is one matmul, not three
 ---------------------------------------------
@@ -51,9 +59,9 @@ unrotated dims form an identity block, which is the rotation by zero and so
 satisfies it trivially.  A block-diagonal matrix whose blocks each satisfy the
 identity satisfies it as a whole, so D(r)^T D(r') = D(r' - r) still holds.
 
-Crucially, P is a FULL head_dim x head_dim matrix: it mixes ACROSS the
-d | h | w | leftover partition.  That mixing is exactly the generalisation
-being bought -- the axes are no longer confined to disjoint channel blocks.
+P is a FULL head_dim x head_dim matrix: it mixes q and k ACROSS the
+d | h | w | leftover partition before the rotation.  The rotation itself stays
+block-diagonal (see "what this does not do" above).
 
   HARD DEPENDENCY: this requires the CORRECT rotary construction, i.e.
   `repeat_interleave(2, dim=-1)` as used in app/vjepa_3/models/utils/modules.py.
@@ -219,8 +227,8 @@ def apply_string(x: torch.Tensor, basis: torch.Tensor) -> torch.Tensor:
     signal.  For any pair of tokens that both skip rotation the score becomes
     q^T P^T P k = q^T k -- provably unchanged from baseline.  Slicing P around
     those tokens instead would break the basis symmetry and make cls-vs-patch
-    scores inconsistent.  Pinned by
-    test_cls_and_register_scores_unchanged_by_string.
+    scores inconsistent.  (Not pinned by a test: no model in this repo
+    builds cls or register tokens with STRING on.)
     """
     if basis is None:
         return x

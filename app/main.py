@@ -80,5 +80,17 @@ if __name__ == "__main__":
     else:
         num_gpus = len(args.devices)
         mp.set_start_method("spawn")
-        for rank in range(num_gpus):
-            mp.Process(target=process_main, args=(rank, args.fname, num_gpus, args.devices)).start()
+        processes = [
+            mp.Process(target=process_main, args=(rank, args.fname, num_gpus, args.devices))
+            for rank in range(num_gpus)
+        ]
+        for process in processes:
+            process.start()
+        # Wait for every rank and pass a failure on as the exit status.  The
+        # launcher used to return 0 whatever its children did, so a shell loop
+        # over configs carried on after a crashed run as if it had finished.
+        for process in processes:
+            process.join()
+        failed = [p.exitcode for p in processes if p.exitcode != 0]
+        if failed:
+            raise SystemExit(1)

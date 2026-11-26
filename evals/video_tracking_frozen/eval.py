@@ -75,6 +75,11 @@ import torch
 import torch.nn.functional as F
 import yaml
 
+from app.vjepa_3.pretrained import (
+    RELEASED_2_1,
+    read_encoder_state_dict,
+    released_2_1_pretrain_config,
+)
 from evals.feature_clustering_frozen.eval import build_encoder, load_encoder_weights
 from evals.video_tracking_frozen.davis import (
     load_frames,
@@ -277,8 +282,17 @@ def main(args_eval, resume_preempt=False):
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-    with open(os.path.join(pretrain_folder, "params-pretrain.yaml"), "r") as f:
-        pretrain_cfg = yaml.safe_load(f)
+    # released: score one of Meta's released V-JEPA 2.1 encoders instead of a
+    # run of ours.  There is no params-pretrain.yaml for those, so the
+    # architecture comes from app/vjepa_3/pretrained.py, and results are
+    # written under `pretrain_folder` (the --out folder).  This is the yardstick
+    # check: does this probe put a known-good model near its published score?
+    released = args_eval.get("released")
+    if released is not None:
+        pretrain_cfg = released_2_1_pretrain_config(released["model_name"])
+    else:
+        with open(os.path.join(pretrain_folder, "params-pretrain.yaml"), "r") as f:
+            pretrain_cfg = yaml.safe_load(f)
     cfg["patch_size"] = pretrain_cfg["data"]["patch_size"]
     cfg["tubelet_size"] = pretrain_cfg["data"]["tubelet_size"]
     n_frames = cfg["tubelet_size"] if cfg["feature_mode"] == "frame" else cfg["frames_per_clip"]
@@ -288,6 +302,13 @@ def main(args_eval, resume_preempt=False):
     if random_init:
         logger.info("random_init: scoring an untrained encoder (probe floor)")
         checkpoint_name = "random-init"
+    elif released is not None:
+        checkpoint_name = os.path.basename(released["path"])
+        checkpoint_key = released["checkpoint_key"]
+        load_encoder_weights(
+            encoder, read_encoder_state_dict(released["path"], checkpoint_key)
+        )
+        logger.info(f"loaded released encoder {checkpoint_name} [{checkpoint_key}]")
     else:
         checkpoint = torch.load(
             os.path.join(pretrain_folder, checkpoint_name), map_location="cpu"
@@ -329,7 +350,7 @@ def main(args_eval, resume_preempt=False):
 
     out_dir = os.path.join(pretrain_folder, "video_tracking_frozen", tag)
     os.makedirs(out_dir, exist_ok=True)
-    stem = os.path.basename(checkpoint_name).replace(".pth.tar", "")
+    stem = os.path.basename(checkpoint_name).replace(".pth.tar", "").replace(".pt", "")
     out_path = os.path.join(out_dir, f"davis_{cfg['split']}_{cfg['feature_mode']}_{stem}.json")
     with open(out_path, "w") as f:
         json.dump(report, f, indent=2)
@@ -339,7 +360,13 @@ def main(args_eval, resume_preempt=False):
 
 def _cli():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--run", required=True, help="pre-training run folder")
+    parser.add_argument("--run", help="pre-training run folder")
+    parser.add_argument(
+        "--released",
+        help="instead of --run: path of a released V-JEPA 2.1 file "
+        "(e.g. vjepa2_1_vitb_dist_vitG_384.pt); needs --out",
+    )
+    parser.add_argument("--out", help="with --released: folder to write the result into")
     parser.add_argument("--davis", required=True, help="DAVIS root folder")
     parser.add_argument("--checkpoint", default="latest.pth.tar")
     parser.add_argument("--mode", default="frame", choices=["frame", "clip"])
@@ -347,9 +374,27 @@ def _cli():
     parser.add_argument("--split", default="val")
     parser.add_argument("--random-init", action="store_true")
     args = parser.parse_args()
+    if (args.run is None) == (args.released is None):
+        parser.error("give exactly one of --run and --released")
+    released = None
+    if args.released is not None:
+        if args.out is None:
+            parser.error("--released needs --out")
+        name = os.path.basename(args.released).replace(".pt", "")
+        if name not in RELEASED_2_1:
+            parser.error(
+                f"{name!r} is not a released V-JEPA 2.1 file name; known: {sorted(RELEASED_2_1)}"
+            )
+        model_name, checkpoint_key = RELEASED_2_1[name]
+        released = {
+            "path": args.released,
+            "model_name": model_name,
+            "checkpoint_key": checkpoint_key,
+        }
     return main(
         {
-            "folder": args.run,
+            "folder": args.run if released is None else args.out,
+            "released": released,
             "checkpoint": args.checkpoint,
             "random_init": args.random_init,
             "experiment": {

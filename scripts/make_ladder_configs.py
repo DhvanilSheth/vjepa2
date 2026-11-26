@@ -9,6 +9,12 @@
     python3 scripts/make_ladder_configs.py            # (re)write the arm files
     python3 scripts/make_ladder_configs.py --check    # exit 1 if they are stale
 
+    # On the training machine: write copies with real paths to a folder that
+    # is NOT tracked, instead of editing the files above by hand.
+    python3 scripts/make_ladder_configs.py --local configs/train_3/local \
+        --folder-root /runs/pretrain_3/ladder --data /data/train_paths.csv \
+        [--pretrained /ckpt/vjepa2_1_vitb_dist_vitG_384.pt] [--seed 1239]
+
 WHY A GENERATOR
 ---------------
 An ablation is only readable if each arm differs from the control in exactly
@@ -31,6 +37,22 @@ AFTER THE LADDER: THE PRESET
 List the winning arms in PRESET and re-run; `modded.yaml` is then written as
 the union of their overrides.  It is empty on purpose until there are results:
 a preset built from guesses cannot be attributed to anything.
+
+OVERRIDE KEYS
+-------------
+A plain key ("rope_theta") is a `model:` key.  A dotted key
+("loss.reg_type") names its section.  Every key must already exist in the
+base file at its baseline value.
+
+THREE FAMILIES
+--------------
+  a / p / f / n   the first screen: architecture changes, from scratch,
+                  compared with a0-control.
+  s               regularisers added to the loss, from scratch, compared with
+                  a0-control.
+  w               encoder started from Meta's released V-JEPA 2.1 ViT-B
+                  (app/vjepa_3/pretrained.py).  Compared with w0-warm-control,
+                  NOT with a0-control: the starting point differs.
 """
 
 import argparse
@@ -44,8 +66,36 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 BASE = REPO_ROOT / "configs" / "train_3" / "proxy" / "base-1gpu.yaml"
 OUT_DIR = REPO_ROOT / "configs" / "train_3" / "ladder"
 FOLDER_ROOT = "/your_folder/pretrain_3/ladder"
+DATA_PLACEHOLDER = "/your_data/ssv2_train_paths.csv"
+PRETRAINED_PLACEHOLDER = "/your_checkpoints/vjepa2_1_vitb_dist_vitG_384.pt"
 
-# name -> (what it tests, warm-startable from a 2.1 checkpoint, model overrides)
+# Regulariser weights for the s-arms.  FIRST GUESSES, not tuned values.
+#
+# The papers weight their regulariser about 10x the prediction loss, but there
+# it is the only thing preventing collapse; here the EMA teacher stays, so the
+# regulariser should push, not take over.  These two values were set with
+# scripts/preflight_arm.py (ViT-B, one step, synthetic clips, Nov 2026): at
+# weight 0.5 SIGReg added a gradient 1.8x the main loss's on the encoder and
+# VISReg 3.3x.  The weights below bring both to roughly a third of the main
+# loss's gradient at the first step, so the two arms push about equally hard.
+# Real video and later steps will differ.
+#
+# Check <folder>/reg_r0.csv after the first epoch (300 iterations): if
+# loss_reg has not fallen, the weight is too small to matter; if loss_main
+# sits well above the control's first-epoch loss, it is too large.
+SIGREG_WEIGHT = 0.1
+VISREG_WEIGHT = 0.05
+
+# The warm-start guards shared by every w-arm (see train.py).  Also first
+# guesses: the predictor trains alone for the lr warm-up (900 iterations),
+# then the encoder moves at a tenth of the schedule's learning rate.
+WARM_START = {
+    "meta.pretrained_encoder": PRETRAINED_PLACEHOLDER,
+    "optimization.freeze_encoder_iters": 900,
+    "optimization.encoder_lr_scale": 0.1,
+}
+
+# name -> (what it tests, can the encoder be loaded from a 2.1 checkpoint, overrides)
 ARMS = {
     "a0-control": (
         "Control. V-JEPA 2.1 behaviour on the proxy recipe.",
@@ -87,6 +137,26 @@ ARMS = {
         False,
         {"norm_type": "derf"},
     ),
+    "s1-sigreg": (
+        "SIGReg (LeJEPA) on the encoder's output tokens, added to the loss.",
+        True,
+        {"loss.reg_type": "sigreg", "loss.reg_weight": SIGREG_WEIGHT},
+    ),
+    "s2-visreg": (
+        "VISReg (centre + scale + sliced-Wasserstein shape) on the encoder's output tokens.",
+        True,
+        {"loss.reg_type": "visreg", "loss.reg_weight": VISREG_WEIGHT},
+    ),
+    "w0-warm-control": (
+        "Control of the warm-start family: released V-JEPA 2.1 ViT-B encoder, nothing else changed.",
+        True,
+        dict(WARM_START),
+    ),
+    "w2-warm-theta-temporal": (
+        "p2-theta-temporal on top of the released encoder. Compare with w0-warm-control.",
+        True,
+        dict(WARM_START, rope_theta=[100.0, 10000.0, 10000.0]),
+    ),
 }
 
 # Arms to combine into configs/train_3/ladder/modded.yaml.  Fill in from
@@ -117,34 +187,65 @@ def _set_key(text, section, key, value):
     return text[:start] + body + text[end:]
 
 
-def _set_folder(text, name):
+def _set_folder(text, name, folder_root):
     pattern = re.compile(r"^folder:.*$", re.M)
     assert len(pattern.findall(text)) == 1
-    return pattern.sub(f"folder: {FOLDER_ROOT}/{name}", text)
+    return pattern.sub(lambda _: f"folder: {folder_root}/{name}", text)
 
 
-def render(name, description, warm_start, overrides):
-    """Return the YAML text for one arm."""
+def split_key(key):
+    """"loss.reg_type" -> ("loss", "reg_type"); a plain key is a `model:` key."""
+    section, _, name = key.rpartition(".")
+    return (section or "model"), name
+
+
+def render(name, description, warm_start, overrides, local=None):
+    """Return the YAML text for one arm.
+
+    `local` (optional) turns the tracked, placeholder-path file into a copy for
+    one machine: {"folder_root", "data", "pretrained", "seed", "suffix"}.
+    """
+    local = local or {}
+    run_name = name + local.get("suffix", "")
+    folder_root = local.get("folder_root") or FOLDER_ROOT
+    overrides = dict(overrides)
+    if local.get("seed") is not None:
+        overrides["meta.seed"] = local["seed"]
+    if local.get("pretrained") and "meta.pretrained_encoder" in overrides:
+        overrides["meta.pretrained_encoder"] = local["pretrained"]
+
     base_text = BASE.read_text()
-    text = _set_folder(base_text, name)
+    if local.get("data"):
+        assert base_text.count(DATA_PLACEHOLDER) == 1, "data placeholder not found in base"
+        base_text = base_text.replace(DATA_PLACEHOLDER, local["data"])
+    text = _set_folder(base_text, run_name, folder_root)
     for key, value in overrides.items():
-        text = _set_key(text, "model", key, value)
+        section, plain = split_key(key)
+        text = _set_key(text, section, plain, value)
 
     # The rewrite is textual (to keep the base file's comments); prove it did
     # exactly what the table says by comparing parsed configs.
     expected = yaml.safe_load(base_text)
-    expected["folder"] = f"{FOLDER_ROOT}/{name}"
-    expected["model"].update(overrides)
+    expected["folder"] = f"{folder_root}/{run_name}"
+    for key, value in overrides.items():
+        section, plain = split_key(key)
+        expected[section][plain] = value
     assert yaml.safe_load(text) == expected, f"{name}: rendered config != base + overrides"
 
     changed = ", ".join(f"{k}: {_yaml_scalar(v)}" for k, v in overrides.items()) or "nothing"
+    local_note = (
+        "# LOCAL COPY for one machine (real paths); regenerate, do not commit.\n" if local else ""
+    )
     header = (
         "# GENERATED by scripts/make_ladder_configs.py from\n"
         f"# configs/train_3/proxy/{BASE.name} -- do not edit this file.\n"
+        f"{local_note}"
         "#\n"
-        f"# ARM {name}: {description}\n"
-        f"# Changes vs a0-control: {changed}\n"
-        f"# Warm start from a V-JEPA 2.1 checkpoint: {'yes' if warm_start else 'NO - train from scratch'}\n"
+        f"# ARM {run_name}: {description}\n"
+        f"# Changes vs the base file: {changed}\n"
+        "# Encoder can be loaded from a V-JEPA 2.1 checkpoint: "
+        f"{'yes' if warm_start else 'NO - different parameters'}"
+        " (only the w-arms actually do; every other arm trains from scratch)\n"
         "#\n"
         "# Everything below this line is the base file with only those keys (and\n"
         "# `folder`) rewritten; the comments are the base file's own.\n"
@@ -153,10 +254,13 @@ def render(name, description, warm_start, overrides):
     return header + text
 
 
-def build_all():
+def build_all(out_dir=None, local=None):
     """{output path: text} for every arm, plus the preset when one is defined."""
+    out_dir = OUT_DIR if out_dir is None else Path(out_dir)
+    suffix = (local or {}).get("suffix", "")
     files = {
-        OUT_DIR / f"{name}.yaml": render(name, *spec) for name, spec in ARMS.items()
+        out_dir / f"{name}{suffix}.yaml": render(name, *spec, local=local)
+        for name, spec in ARMS.items()
     }
     if PRESET:
         unknown = [arm for arm in PRESET if arm not in ARMS]
@@ -171,8 +275,8 @@ def build_all():
                     )
                 merged[key] = value
         warm = all(ARMS[arm][1] for arm in PRESET)
-        files[OUT_DIR / "modded.yaml"] = render(
-            "modded", "Preset: " + " + ".join(PRESET) + ".", warm, merged
+        files[out_dir / f"modded{suffix}.yaml"] = render(
+            "modded", "Preset: " + " + ".join(PRESET) + ".", warm, merged, local=local
         )
     return files
 
@@ -182,7 +286,27 @@ def main(argv=None):
     parser.add_argument(
         "--check", action="store_true", help="verify the files on disk; write nothing"
     )
+    parser.add_argument(
+        "--local",
+        metavar="DIR",
+        help="write copies with this machine's paths to DIR (never the tracked folder)",
+    )
+    parser.add_argument("--folder-root", help="--local: parent folder of the run folders")
+    parser.add_argument("--data", help="--local: path of the training video list (csv)")
+    parser.add_argument(
+        "--pretrained", help="--local: path of the released encoder file, for the w-arms"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="--local: set meta.seed and add -seed<N> to file and folder names",
+    )
     args = parser.parse_args(argv)
+
+    if args.local:
+        return _write_local(args)
+    if args.folder_root or args.data or args.pretrained or args.seed is not None:
+        parser.error("--folder-root, --data, --pretrained and --seed need --local DIR")
 
     files = build_all()
     expected_names = {path.name for path in files}
@@ -211,6 +335,30 @@ def main(argv=None):
         print(f"wrote   {path.relative_to(REPO_ROOT)}")
     for path in extra:
         print(f"ORPHAN  {path.relative_to(REPO_ROOT)}  (no such arm; delete it by hand)")
+    return 0
+
+
+def _write_local(args):
+    out_dir = Path(args.local).resolve()
+    if out_dir == OUT_DIR.resolve():
+        print(f"refusing to write local copies into the tracked folder {OUT_DIR}")
+        return 1
+    if not args.folder_root or not args.data:
+        print("--local needs --folder-root and --data")
+        return 1
+    local = {
+        "folder_root": args.folder_root.rstrip("/"),
+        "data": args.data,
+        "pretrained": args.pretrained,
+        "seed": args.seed,
+        "suffix": "" if args.seed is None else f"-seed{args.seed}",
+    }
+    files = build_all(out_dir=out_dir, local=local)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for path, text in files.items():
+        placeholder = PRETRAINED_PLACEHOLDER in text
+        path.write_text(text)
+        print(f"wrote   {path}" + ("   (needs --pretrained before it can run)" if placeholder else ""))
     return 0
 
 

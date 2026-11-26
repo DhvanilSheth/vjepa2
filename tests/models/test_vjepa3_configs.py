@@ -55,6 +55,33 @@ V3_MODEL_DEFAULTS = {
     "norm_out_type": None,
 }
 
+# Every V-JEPA 3 knob OUTSIDE `model:` and the value that reproduces V-JEPA 2.1,
+# as (section, key) -> default.
+V3_OTHER_DEFAULTS = {
+    ("loss", "reg_type"): None,
+    ("loss", "reg_weight"): 0.0,
+    ("loss", "reg_num_slices"): 1024,
+    ("loss", "reg_max_tokens"): 4096,
+    ("meta", "pretrained_encoder"): None,
+    ("meta", "pretrained_encoder_key"): "ema_encoder",
+    ("optimization", "clip_grad"): None,
+    ("optimization", "freeze_encoder_iters"): 0,
+    ("optimization", "encoder_lr_scale"): 1.0,
+}
+
+# `loss:` keys present in the configs that nothing reads.  Inherited from
+# V-JEPA 2.1 (ladder audit C-17); listed so a NEW orphan is still caught.
+KNOWN_DEAD_LOSS_KEYS = {
+    "reg_coeff",
+    # The cooldown configs ship four Gram-loss keys.  The released V-JEPA 2.1
+    # train.py has no Gram loss (only a `gram_mode` argument that is always
+    # False), so in this fork, as upstream, they do nothing.
+    "computing_gram_loss",
+    "gram_HighRes",
+    "gram_ckpt",
+    "gram_loss_weight",
+}
+
 # `meta:` keys present in the configs that nothing reads.  Inherited from
 # V-JEPA 2.1 and listed so the meta-key test can still catch a NEW orphan.
 KNOWN_DEAD_META_KEYS = {
@@ -152,6 +179,39 @@ class TestVJepa3ConfigKeysHaveReaders(unittest.TestCase):
                     orphans.setdefault(key, []).append(str(path.relative_to(REPO_ROOT)))
         self.assertEqual(orphans, {}, "meta keys with no reader in train.py")
         self.assertIn("sigreg_diag_freq", read_keys)
+
+    def test_every_loss_and_optimization_key_is_read(self):
+        source = TRAIN_PY.read_text()
+        for section, var, known_dead in (
+            ("loss", "cfgs_loss", KNOWN_DEAD_LOSS_KEYS),
+            ("optimization", "cfgs_opt", set()),
+        ):
+            read_keys = set(re.findall(rf'{var}\.get\(\s*"([^"]+)"', source))
+            orphans = {}
+            for path in sorted(CONFIG_DIR.rglob("*.yaml")):
+                cfg = yaml.safe_load(path.read_text())
+                for key in cfg.get(section) or {}:
+                    if key not in read_keys | known_dead:
+                        orphans.setdefault(key, []).append(str(path.relative_to(REPO_ROOT)))
+            with self.subTest(section=section):
+                self.assertEqual(orphans, {}, f"{section} keys with no reader in train.py")
+
+    def test_persistent_workers_is_read_and_passed_on(self):
+        """V-JEPA 2.1 shipped `data.persistent_workers` with no reader (ladder
+        audit L-20); the workers were respawned at every data refill."""
+        source = TRAIN_PY.read_text()
+        self.assertIn('cfgs_data.get("persistent_workers", False)', source)
+        call = source[source.index("init_data(\n") :]
+        call = call[: call.index("log_dir=None")]
+        self.assertIn("persistent_workers=persistent_workers,", call)
+
+    def test_new_non_model_keys_are_present_and_defaulted_to_baseline(self):
+        for path in _baseline_configs():
+            cfg = yaml.safe_load(path.read_text())
+            for (section, key), default in V3_OTHER_DEFAULTS.items():
+                with self.subTest(config=str(path.relative_to(REPO_ROOT)), key=f"{section}.{key}"):
+                    self.assertIn(key, cfg[section], "missing")
+                    self.assertEqual(cfg[section][key], default, "not at baseline")
 
     def test_baseline_configs_declare_no_orphan_from_2_1(self):
         """The dead 2.1 keys must not be carried into v3 configs.
@@ -266,27 +326,83 @@ class TestAblationLadder(unittest.TestCase):
         self.assertEqual(on_disk, {p.name for p in files}, "orphan ladder file")
         self.assertEqual(self.script.main(["--check"]), 0)
 
+    def _changed(self, cfg):
+        """Every leaf where `cfg` differs from the base, as the generator's
+        override keys: plain for `model:`, "section.key" elsewhere."""
+        changed = {}
+        self.assertEqual(set(cfg), set(self.base))
+        for section, value in cfg.items():
+            if section == "folder":
+                continue
+            if not isinstance(value, dict):
+                self.assertEqual(value, self.base[section], section)
+                continue
+            self.assertEqual(set(value), set(self.base[section]), f"key set of {section}:")
+            for key, leaf in value.items():
+                if leaf != self.base[section][key]:
+                    changed[key if section == "model" else f"{section}.{key}"] = leaf
+        return changed
+
     def test_each_arm_changes_only_what_it_declares(self):
         for name, (_, _, overrides) in self.script.ARMS.items():
             with self.subTest(arm=name):
                 cfg = yaml.safe_load((LADDER_DIR / f"{name}.yaml").read_text())
-                self.assertTrue(cfg.pop("folder").endswith(f"/{name}"))
-                base = {k: v for k, v in self.base.items() if k != "folder"}
-                model, base_model = cfg.pop("model"), base.pop("model")
-                self.assertEqual(cfg, base, "an arm changed something outside model:")
-                diff = {k: model[k] for k in model if model[k] != base_model.get(k)}
-                self.assertEqual(diff, overrides)
-                self.assertEqual(set(model), set(base_model))
+                self.assertTrue(cfg["folder"].endswith(f"/{name}"))
+                self.assertEqual(self._changed(cfg), overrides)
 
     def test_control_is_the_baseline_and_arms_are_distinct(self):
         arms = self.script.ARMS
         self.assertEqual(arms["a0-control"][2], {})
         for key, default in V3_MODEL_DEFAULTS.items():
             self.assertEqual(self.base["model"][key], default)
+        for (section, key), default in V3_OTHER_DEFAULTS.items():
+            self.assertEqual(self.base[section][key], default)
         overrides = [tuple(sorted(map(str, spec[2].items()))) for spec in arms.values()]
         self.assertEqual(len(set(overrides)), len(overrides), "two arms are identical")
+        allowed = set(V3_MODEL_DEFAULTS) | {f"{s}.{k}" for s, k in V3_OTHER_DEFAULTS}
         for name, (_, _, changed) in arms.items():
-            self.assertLessEqual(set(changed), set(V3_MODEL_DEFAULTS), name)
+            self.assertLessEqual(set(changed), allowed, name)
+
+    def test_the_warm_family_shares_its_guards(self):
+        """Every w-arm must differ from w0-warm-control only by its own change,
+        or the comparison inside the family is not single-variable."""
+        arms = self.script.ARMS
+        control = arms["w0-warm-control"][2]
+        self.assertEqual(set(control), set(self.script.WARM_START))
+        for name, (_, _, changed) in arms.items():
+            if name.startswith("w"):
+                with self.subTest(arm=name):
+                    self.assertEqual({k: changed[k] for k in control}, control)
+            else:
+                with self.subTest(arm=name):
+                    self.assertFalse(set(changed) & set(control), "a from-scratch arm warm-starts")
+
+    def test_local_copies_change_only_paths_and_seed(self):
+        """--local writes a machine's real paths without touching anything else."""
+        local = {
+            "folder_root": "/runs/ladder",
+            "data": "/data/train.csv",
+            "pretrained": "/ckpt/enc.pt",
+            "seed": 7,
+            "suffix": "-seed7",
+        }
+        files = self.script.build_all(out_dir="/nonexistent/local", local=local)
+        self.assertEqual(len(files), len(self.script.ARMS))
+        for name, (_, _, overrides) in self.script.ARMS.items():
+            with self.subTest(arm=name):
+                cfg = yaml.safe_load(files[Path("/nonexistent/local") / f"{name}-seed7.yaml"])
+                self.assertEqual(cfg["folder"], f"/runs/ladder/{name}-seed7")
+                self.assertEqual(cfg["data"]["datasets"], ["/data/train.csv"])
+                cfg["data"]["datasets"] = self.base["data"]["datasets"]
+                expected = dict(overrides, **{"meta.seed": 7})
+                if "meta.pretrained_encoder" in expected:
+                    expected["meta.pretrained_encoder"] = "/ckpt/enc.pt"
+                self.assertEqual(self._changed(cfg), expected)
+        self.assertEqual(
+            self.script.main(["--local", str(LADDER_DIR), "--folder-root", "/x", "--data", "/y"]),
+            1,
+            "local copies must never be written into the tracked folder",
+        )
 
     def test_warm_start_flag_matches_what_the_arm_changes(self):
         """FFN / norm arms change the function the weights compute, so they
@@ -295,6 +411,8 @@ class TestAblationLadder(unittest.TestCase):
         for name, (_, warm, changed) in self.script.ARMS.items():
             with self.subTest(arm=name):
                 self.assertEqual(warm, not (set(changed) & from_scratch_keys))
+                if "meta.pretrained_encoder" in changed:
+                    self.assertTrue(warm, "a w-arm changes the encoder's parameters")
 
     def test_every_arm_builds_and_runs(self):
         """Build each arm's encoder (at vit_tiny width, CPU) and run it."""
@@ -313,10 +431,21 @@ class TestAblationLadder(unittest.TestCase):
                     outputs[name] = enc(x)
                 self.assertTrue(torch.isfinite(outputs[name]).all())
         # p3-string starts at P = I, so it is SUPPOSED to equal the control.
-        torch.testing.assert_close(outputs["p3-string"], outputs["a0-control"], rtol=0, atol=0)
+        # So is every arm that changes no `model:` key: a regulariser or a
+        # warm start alters training, not the function the encoder computes.
+        same_function = {"p3-string"} | {
+            name
+            for name, (_, _, changed) in self.script.ARMS.items()
+            if name != "a0-control" and all("." in key for key in changed)
+        }
+        self.assertIn("s1-sigreg", same_function)
         for name, out in outputs.items():
-            if name not in ("a0-control", "p3-string"):
-                with self.subTest(arm=name):
+            if name == "a0-control":
+                continue
+            with self.subTest(arm=name):
+                if name in same_function:
+                    torch.testing.assert_close(out, outputs["a0-control"], rtol=0, atol=0)
+                else:
                     self.assertFalse(
                         torch.allclose(out, outputs["a0-control"]),
                         f"{name} is indistinguishable from the control",

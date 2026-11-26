@@ -24,6 +24,8 @@ import torch.nn.functional as F
 from app.vjepa_3.diagnostics import gaussian_floor, isotropy_report
 from app.vjepa_3.models.utils.masks_dist import compute_mask_distance
 from app.vjepa_3.models.utils.modules import Lambda_LinearWarmupHold
+from app.vjepa_3.pretrained import load_pretrained_encoder
+from app.vjepa_3.regularizers import gather_reg_tokens, resolve_regularizer
 from app.vjepa_3.transforms import make_transforms
 from app.vjepa_3.utils import (
     init_opt,
@@ -76,6 +78,14 @@ def main(args, resume_preempt=False):
     #    Measurement only -- it never touches the loss.  0 = off, in which
     #    case the training loop below is unchanged.
     sigreg_diag_freq = cfgs_meta.get("sigreg_diag_freq", 0)
+    # -- V-JEPA 3: start the ENCODER from a released V-JEPA 2.1 file (or any
+    #    v3 checkpoint) instead of from random weights.  The predictor still
+    #    starts untrained -- see app/vjepa_3/pretrained.py for why, and
+    #    freeze_encoder_iters / encoder_lr_scale below for the guards.
+    #    null => from scratch, unchanged.  A `latest.pth.tar` in the run
+    #    folder still wins: resuming overrides this.
+    pretrained_encoder = cfgs_meta.get("pretrained_encoder", None)
+    pretrained_encoder_key = cfgs_meta.get("pretrained_encoder_key", "ema_encoder")
     logger.info(f"LD_PRELOAD: {os.environ.get('LD_PRELOAD')}")
     which_dtype = cfgs_meta.get("dtype")
     logger.info(f"{which_dtype=}")
@@ -190,6 +200,13 @@ def main(args, resume_preempt=False):
     grid_size = crop_size // patch_size
     pin_mem = cfgs_data.get("pin_mem", False)
     num_workers = cfgs_data.get("num_workers", 1)
+    # -- V-JEPA 3: V-JEPA 2.1 never read this key, so its loader respawned
+    #    every worker each time the data ran out (about 110 s per refill on
+    #    the proxy recipe, 19 times a run).  Default False = that behaviour.
+    #    The eight ladder runs of Nov 2026 all ran with it False whatever
+    #    their yaml said; keep it False for any arm compared with them, since
+    #    kept-alive workers draw a different augmentation and mask stream.
+    persistent_workers = cfgs_data.get("persistent_workers", False)
 
     # -- IMG DATA
     cfgs_img_data = args.get("img_data")
@@ -221,6 +238,15 @@ def main(args, resume_preempt=False):
     predict_all = cfgs_loss.get("predict_all", True)
     weight_distance_loss = cfgs_loss.get("weight_distance_loss", False)
     offset_context_loss = cfgs_loss.get("offset_context_loss", False)
+    # -- V-JEPA 3: optional regulariser on the context encoder's output tokens
+    #    (app/vjepa_3/regularizers.py).  reg_type: null | sigreg | visreg.
+    #    null => the loss is V-JEPA 2.1's, unchanged.
+    regularizer, reg_weight = resolve_regularizer(
+        cfgs_loss.get("reg_type", None),
+        cfgs_loss.get("reg_weight", 0.0),
+        num_slices=cfgs_loss.get("reg_num_slices", 1024),
+    )
+    reg_max_tokens = cfgs_loss.get("reg_max_tokens", 4096)
 
     # -- OPTIMIZATION
     cfgs_opt = args.get("optimization")
@@ -256,6 +282,24 @@ def main(args, resume_preempt=False):
     loss_reg_min_epoch = cfgs_opt.get("loss_reg_min_epoch", 50)
     if loss_reg_std_mult is not None:
         logger.info("Loss regulation activated")
+    # -- V-JEPA 3 (all three default to V-JEPA 2.1's behaviour):
+    #    clip_grad: max global gradient norm over encoder + predictor; null =
+    #      no clipping, as in 2.1.
+    #    freeze_encoder_iters: the encoder takes no optimizer step for this
+    #      many iterations.  For a warm start: the untrained predictor learns
+    #      against the pretrained encoder before it is allowed to change it.
+    #    encoder_lr_scale: the encoder's learning rate as a multiple of the
+    #      schedule's (the predictor always gets the schedule's value).
+    clip_grad = cfgs_opt.get("clip_grad", None)
+    freeze_encoder_iters = int(cfgs_opt.get("freeze_encoder_iters", 0) or 0)
+    encoder_lr_scale = float(cfgs_opt.get("encoder_lr_scale", 1.0))
+    if clip_grad is not None and float(clip_grad) <= 0:
+        raise ValueError(f"optimization.clip_grad must be > 0 or null, got {clip_grad}")
+    if freeze_encoder_iters < 0 or encoder_lr_scale <= 0:
+        raise ValueError(
+            "optimization.freeze_encoder_iters must be >= 0 and encoder_lr_scale > 0, "
+            f"got {freeze_encoder_iters} and {encoder_lr_scale}"
+        )
     # ----------------------------------------------------------------------- #
 
     np.random.seed(seed)
@@ -412,6 +456,19 @@ def main(args, resume_preempt=False):
             ("%d", "n_tokens"),
         )
 
+    # -- V-JEPA 3: with a regulariser on, `loss` in log_r*.csv is the total
+    #    that is optimised.  This file keeps the two parts apart, every
+    #    iteration, so the prediction loss stays comparable with other arms.
+    reg_logger = None
+    if regularizer is not None and rank == 0:
+        reg_logger = CSVLogger(
+            os.path.join(folder, f"reg_r{rank}.csv"),
+            ("%d", "epoch"),
+            ("%d", "itr"),
+            ("%.5f", "loss_main"),
+            ("%.5f", "loss_reg"),
+        )
+
     # -- init model
     encoder, predictor = init_video_model(
         uniform_power=uniform_power,
@@ -455,6 +512,12 @@ def main(args, resume_preempt=False):
         norm_type=norm_type,
         norm_out_type=norm_out_type,
     )
+    if pretrained_encoder is not None:
+        load_pretrained_encoder(encoder, pretrained_encoder, pretrained_encoder_key)
+        logger.info(
+            f"encoder initialised from {pretrained_encoder} [{pretrained_encoder_key}]; "
+            "the predictor starts untrained"
+        )
     target_encoder = copy.deepcopy(encoder)
 
     if compile_model:
@@ -498,6 +561,7 @@ def main(args, resume_preempt=False):
         collator=mask_collator,
         num_workers=num_workers,
         pin_mem=pin_mem,
+        persistent_workers=persistent_workers,
         log_dir=None,
     )
     try:
@@ -587,9 +651,25 @@ def main(args, resume_preempt=False):
                 next(momentum_scheduler)
                 mask_collator.step()
 
+    # -- V-JEPA 3: which optimizer groups hold encoder parameters, found by
+    #    identity AFTER any resume (load_state_dict replaces the group dicts,
+    #    so a tag stored on a group would not survive it).
+    _encoder_param_ids = {id(p) for p in encoder.parameters()}
+    encoder_group_indices = [
+        i
+        for i, group in enumerate(optimizer.param_groups)
+        if group["params"] and id(group["params"][0]) in _encoder_param_ids
+    ]
+    if freeze_encoder_iters > 0 or encoder_lr_scale != 1.0:
+        logger.info(
+            f"encoder: no optimizer step before iteration {freeze_encoder_iters}; "
+            f"lr x{encoder_lr_scale} (optimizer groups {encoder_group_indices})"
+        )
+
     def save_checkpoint(epoch, path):
+        """Write a checkpoint; True if it is on disk (always True off rank 0)."""
         if rank != 0:
-            return
+            return True
         save_dict = {
             "encoder": encoder.state_dict(),
             "predictor": predictor.state_dict(),
@@ -602,10 +682,22 @@ def main(args, resume_preempt=False):
             "world_size": world_size,
             "lr": lr,
         }
+        # -- V-JEPA 3: write beside the target, then rename.  V-JEPA 2.1 wrote
+        #    in place, so a crash or a full disk mid-write left a truncated
+        #    latest.pth.tar and nothing to resume from.  os.replace is atomic:
+        #    the old file stays whole until the new one is complete.
+        tmp_path = path + ".tmp"
         try:
-            torch.save(save_dict, path)
+            torch.save(save_dict, tmp_path)
+            os.replace(tmp_path, path)
+            return True
         except Exception as e:
-            logger.info(f"Encountered exception when saving checkpoint: {e}")
+            logger.error(f"Encountered exception when saving checkpoint {path}: {e}")
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            return False
 
     logger.info("Initializing loader...")
     unsupervised_sampler.set_epoch(start_epoch)
@@ -700,10 +792,15 @@ def main(args, resume_preempt=False):
                 and (epoch * ipe + itr) % sigreg_diag_freq == 0
             )
             diag_stats = {}
+            reg_stats = {}
+            global_itr = epoch * ipe + itr
 
             def train_step():
                 _new_lr = scheduler.step()
                 _new_wd = wd_scheduler.step()
+                if encoder_lr_scale != 1.0:
+                    for i in encoder_group_indices:
+                        optimizer.param_groups[i]["lr"] = _new_lr * encoder_lr_scale
 
                 def forward_target(c, embed_dim=embed_dim_encoder):
                     with torch.no_grad():
@@ -751,7 +848,7 @@ def main(args, resume_preempt=False):
 
                         if predict_all:
                             z_context = normalize_nested(z_context, embed_dim)
-                    return z_pred, z_context
+                    return z_pred, z_context, z
 
                 def loss_fn(z, h, masks_to_apply, cls_loss, d_weights):
                     if cls_loss:
@@ -804,7 +901,7 @@ def main(args, resume_preempt=False):
                 # Step 1. Forward
                 with torch.amp.autocast("cuda", dtype=dtype, enabled=mixed_precision):
                     h = forward_target(clips)
-                    z_pred, z_context = forward_context(clips)
+                    z_pred, z_context, z_enc = forward_context(clips)
                     loss = 0
                     loss_pred = loss_fn(
                         z_pred, h, masks_pred, cls_loss=has_cls_first, d_weights=None
@@ -828,6 +925,21 @@ def main(args, resume_preempt=False):
                         else:
                             lambda_value_step = lambda_value
                         loss += loss_context * lambda_value_step
+
+                    # -- V-JEPA 3: optional regulariser on the encoder tokens.
+                    #    Skipped entirely when off, so the default path is
+                    #    V-JEPA 2.1's.  The regulariser computes in float32
+                    #    whatever the autocast dtype.
+                    if regularizer is not None:
+                        loss_reg = regularizer(
+                            gather_reg_tokens(
+                                z_enc, embed_dim_encoder, reg_max_tokens, seed=global_itr
+                            ),
+                            seed=global_itr,
+                        )
+                        reg_stats["main"] = float(loss.detach())
+                        reg_stats["reg"] = float(loss_reg.detach())
+                        loss = loss + reg_weight * loss_reg
 
                 # Step 2. Backward & step
                 run_step = True
@@ -853,6 +965,22 @@ def main(args, resume_preempt=False):
                         scaler.unscale_(optimizer)
                     else:
                         loss.backward()
+                    if global_itr < freeze_encoder_iters:
+                        # AdamW skips a parameter whose grad is None: no
+                        # update and no weight decay, so the encoder (and so
+                        # its EMA copy) stays exactly where it started.
+                        for p in encoder.parameters():
+                            p.grad = None
+                    if clip_grad is not None:
+                        torch.nn.utils.clip_grad_norm_(
+                            [
+                                p
+                                for model in (encoder, predictor)
+                                for p in model.parameters()
+                                if p.grad is not None
+                            ],
+                            float(clip_grad),
+                        )
                     if mixed_precision:
                         scaler.step(optimizer)
                         scaler.update()
@@ -862,16 +990,22 @@ def main(args, resume_preempt=False):
 
                 # Step 3. momentum update of target encoder
                 m = min(next(momentum_scheduler), ema[1])
-                with torch.no_grad():
-                    params_k = []
-                    params_q = []
-                    for param_q, param_k in zip(
-                        encoder.parameters(), target_encoder.parameters()
-                    ):
-                        params_k.append(param_k)
-                        params_q.append(param_q)
-                    torch._foreach_mul_(params_k, m)
-                    torch._foreach_add_(params_k, params_q, alpha=1 - m)
+                # -- V-JEPA 3: while the encoder is frozen the target already
+                #    equals it, and m*x + (1-m)*x is not exactly x in floating
+                #    point, so the update is skipped rather than left to drift.
+                #    The schedule above still advances.  freeze_encoder_iters
+                #    is 0 by default, so this is always taken in a 2.1 run.
+                if global_itr >= freeze_encoder_iters:
+                    with torch.no_grad():
+                        params_k = []
+                        params_q = []
+                        for param_q, param_k in zip(
+                            encoder.parameters(), target_encoder.parameters()
+                        ):
+                            params_k.append(param_k)
+                            params_q.append(param_q)
+                        torch._foreach_mul_(params_k, m)
+                        torch._foreach_add_(params_k, params_q, alpha=1 - m)
 
                 return (
                     float(loss.detach()),
@@ -914,6 +1048,8 @@ def main(args, resume_preempt=False):
                     gpu_etime_ms,
                     data_elapsed_time_ms,
                 )
+                if reg_stats and reg_logger is not None:
+                    reg_logger.log(epoch + 1, itr, reg_stats["main"], reg_stats["reg"])
                 if diag_stats:
                     diag_logger.log(
                         epoch + 1,
@@ -976,8 +1112,15 @@ def main(args, resume_preempt=False):
         # -- Save Checkpoint
         logger.info("avg. loss %.3f" % loss_meter.avg)
         if (epoch + 1) % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
-            save_checkpoint(epoch + 1, latest_path)
+            saved = save_checkpoint(epoch + 1, latest_path)
             if save_every_freq > 0 and (epoch + 1) % save_every_freq == 0:
                 save_every_file = f"e{epoch}.pth.tar"
                 save_every_path = os.path.join(folder, save_every_file)
-                save_checkpoint(epoch + 1, save_every_path)
+                saved = save_checkpoint(epoch + 1, save_every_path) and saved
+            # -- V-JEPA 3: a run that ends without its final checkpoint has
+            #    produced nothing.  Fail, so the launcher exits non-zero and a
+            #    shell loop over arms stops instead of moving on.
+            if epoch == (num_epochs - 1) and not saved:
+                raise RuntimeError(
+                    f"final checkpoint could not be written to {folder}; see the log above"
+                )

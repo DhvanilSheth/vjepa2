@@ -311,6 +311,63 @@ class TestEndToEnd(unittest.TestCase):
             self.assertIsNone(floor["epoch"])
             self.assertEqual(floor["checkpoint"], "random-init")
 
+    def test_released_encoder_is_scored_without_a_run_folder(self):
+        """--released: architecture from app/vjepa_3/pretrained.py, weights
+        from a file laid out like Meta's, results under --out."""
+        from app.vjepa_3.pretrained import released_2_1_pretrain_config
+
+        name = "vjepa2_1_vitb_dist_vitG_384"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            davis = root / "DAVIS"
+            _write_fake_davis(davis)
+            reports = []
+            for seed in (0, 1):
+                torch.manual_seed(seed)
+                encoder = build_encoder(released_2_1_pretrain_config("vit_base"), 64, 2)
+                path = root / f"seed{seed}" / f"{name}.pt"
+                path.parent.mkdir()
+                state = {f"module.backbone.{k}": v for k, v in encoder.state_dict().items()}
+                torch.save({"ema_encoder": state, "predictor": {}}, path)
+                out = root / f"out{seed}"
+                args = self._args(out, davis)
+                args["released"] = {
+                    "path": str(path),
+                    "model_name": "vit_base",
+                    "checkpoint_key": "ema_encoder",
+                }
+                reports.append(tracking.main(args))
+                self.assertEqual(reports[-1]["checkpoint"], f"{name}.pt")
+                result = out / "video_tracking_frozen" / "davis-tracking" / f"davis_val_frame_{name}.json"
+                self.assertTrue(result.exists())
+            # different weights, different scores ...
+            self.assertNotEqual(reports[0]["per_object"], reports[1]["per_object"])
+            # ... and the same file twice, the same scores.  Together: the file
+            # is what is scored (an encoder left at its random init would
+            # differ between two calls).
+            torch.manual_seed(12345)
+            again = tracking.main(args)
+            self.assertEqual(again["per_object"], reports[1]["per_object"])
+
+            args["released"]["checkpoint_key"] = "target_encoder"
+            with self.assertRaisesRegex(KeyError, "no 'target_encoder' entry"):
+                tracking.main(args)
+
+    def test_command_line_wants_exactly_one_source(self):
+        import sys
+        from unittest import mock
+
+        cases = (
+            ["--davis", "d"],
+            ["--davis", "d", "--run", "r", "--released", "x.pt", "--out", "o"],
+            ["--davis", "d", "--released", "vjepa2_1_vitb_dist_vitG_384.pt"],  # no --out
+            ["--davis", "d", "--released", "some_other_model.pt", "--out", "o"],
+        )
+        for argv in cases:
+            with self.subTest(argv=argv), mock.patch.object(sys, "argv", ["eval.py", *argv]):
+                with mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                    tracking._cli()
+
     def test_mismatched_checkpoint_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

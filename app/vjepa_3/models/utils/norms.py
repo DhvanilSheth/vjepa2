@@ -26,8 +26,9 @@ WHAT IS AND IS NOT REPLACED
 `norm_out_type` replaces the OUTPUT norms -- the encoder's four deep-supervision
 `norms_block` and the predictor's `predictor_norm` -- and defaults to following
 `norm_type`.  It is a separate key because the predictor's output is regressed
-onto LayerNorm-standardised targets, an interaction specific to this objective
-that neither paper tested.
+onto LayerNorm-standardised targets, an interaction specific to this objective.
+(DyT's MAE experiment does replace the output norm before a regression head;
+Derf reports no such case.  Ladder audit N-13.)
 
 The `F.layer_norm` calls in train.py (target standardisation) are part of the
 LOSS, not the architecture, and are never replaced.

@@ -43,9 +43,12 @@ def build_omega(dim, theta=DEFAULT_ROPE_THETA, dtype=torch.float32, device=None)
     Channels sweeping under ~0.2 rad over the whole clip carry almost no
     positional signal: 6 of 10 temporal channels at 16 frames, 5 of 10 spatial.
     Lowering theta compresses the spectrum onto the range that actually exists.
-    The STRING paper (Schenck et al., 2025) independently initialises with max
-    wavelength 100 rather than 10,000, following RoPE-Mixed -- convergent
-    evidence that the language-model default is mismatched here.
+    The evidence for a smaller base is thin (ladder audit R-08, R-11): one
+    heuristic from 2-D image RoPE (Heo et al., RoPE-Mixed).  The STRING paper
+    uses 100 for its own learned variant and keeps 10,000 for plain RoPE, and
+    nothing cited tests a smaller base on a temporal axis.  The ">0.2 rad"
+    count is this file's own criterion; by "wavelength shorter than the axis"
+    the count barely moves.  Treat the base as a hypothesis under test.
 
     Reproduce the table above with:
         python3 -c "n=10; om=[10000**(-i/n) for i in range(n)]; \\

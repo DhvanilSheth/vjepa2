@@ -23,8 +23,11 @@ V-JEPA 2.1's RoPE makes two arbitrary choices:
 `RoPEAttention` splits `head_dim=64` into `d_dim = h_dim = w_dim = 20`
 ([modules.py:253-255](../app/vjepa_3/models/utils/modules.py)), permanently
 assigning dims 0–19 to time, 20–39 to height, 40–59 to width, 4 unrotated.
-Nothing says the axes shouldn't share subspaces. **Cayley-STRING** replaces
-this with a learned orthogonal basis (§4).
+**Cayley-STRING** puts a learned orthogonal basis in front of this split (§4).
+It does not let the axes share rotation planes: the rotation keeps its
+per-axis blocks and frequencies, and the basis can be folded exactly into each
+layer's q/k weights, so the arm tests optimisation, not a larger function
+class (audit S-01, S-03).
 
 **(b) RoPE base 10000, inherited from language models.** LLMs have thousands of
 positions; V-JEPA has 8–32. Most of the spectrum never turns. Measured sweep
@@ -42,8 +45,12 @@ python3 -c "n=10; om=[10000**(-i/n) for i in range(n)]; print([round(o*7,3) for 
 ```
 
 Lowering the base compresses the spectrum onto the range that actually exists:
-θ=1000 → 6/10 live, θ=100 → 8/10. The STRING paper independently initialises
-with max wavelength 100 (following RoPE-Mixed) — convergent evidence. Note even
+θ=1000 → 6/10 live, θ=100 → 8/10. Those counts are for the encoder's 10
+frequency pairs under this document's own ">0.2 rad" criterion; the predictor
+has 5 pairs per axis, and by "wavelength shorter than the axis" the count
+barely moves (audit R-08, R-10). The supporting evidence is one heuristic from
+2-D image RoPE (RoPE-Mixed); the STRING paper keeps 10,000 for plain RoPE, and
+nothing cited tests a smaller base on a temporal axis (audit R-11). Note even
 θ=100 does not revive all ten; it widens the band, it doesn't saturate it.
 
 ---
@@ -96,7 +103,9 @@ diff -r app/vjepa_2_1 app/vjepa_3 -x '__pycache__'
 | `models/utils/ffn.py` | **NEW** — `SquaredReLU`, the GLU gate table, `resolve_ffn_type` (§9.1) |
 | `models/utils/norms.py` | **NEW** — `DynamicTanh`, `DynamicErf`, `build_norm_layer` (§9.2) |
 | `diagnostics.py` | **NEW** — SIGReg / Epps-Pulley isotropy reading (§9.3) |
-| `train.py` | 10 new `cfgs_model.get`, 1 new `cfgs_meta.get`; `EMBED_DIM_BY_MODEL_NAME` (§6); the diagnostic hook; single-rank guard (§6) |
+| `regularizers.py` | **NEW** — SIGReg and VISReg as optional loss terms on the encoder's tokens (§9.7) |
+| `pretrained.py` | **NEW** — loading a released V-JEPA 2.1 encoder; what can and cannot be carried over (§9.8) |
+| `train.py` | 10 new `cfgs_model.get`, 3 new `cfgs_meta.get`; `EMBED_DIM_BY_MODEL_NAME` (§6); the diagnostic hook; single-rank guard (§6); the regulariser term (§9.7); encoder warm start, freeze and lr scale (§9.8); gradient clipping; atomic checkpoints and `persistent_workers` (§6) |
 | `utils.py` | 10 new `init_video_model` params; `init_opt` weight-decay exclusion (§4.3) |
 | `wrappers.py`, `transforms.py`, `patch_embed.py`, `pos_embs.py`, `masks_dist.py` | unchanged copies |
 | `models/utils/embeddings.py` | **DEAD** — nothing imports it. Removed from 2.1 after the fork snapshot; retained here only as an artifact. Safe to delete. |
@@ -111,7 +120,12 @@ Outside `app/vjepa_3/`:
 | `configs/eval_3/vitb16/davis-tracking.yaml` | config for that probe |
 | `configs/train_3/proxy/base-1gpu.yaml` | single-GPU, video-only base recipe (§9.5) |
 | `configs/train_3/ladder/*.yaml` | **GENERATED** ablation arms — do not edit |
-| `scripts/make_ladder_configs.py` | the generator, and the `ARMS` table that defines the ladder |
+| `scripts/make_ladder_configs.py` | the generator, and the `ARMS` table that defines the ladder; `--local` writes copies with one machine's paths (§9.5) |
+| `scripts/preflight_arm.py` | **NEW** — one real training step of an arm against the control; run before any arm goes to the GPU (§9.9) |
+| `scripts/compare_tracking.py` | **NEW** — tracking scores against a control with error bars and a training-noise yardstick (§9.9) |
+| `tests/train/` | **NEW** — the real `train.main()` end to end on CPU (`harness.py`), and the launcher's exit status |
+| `V3_STRING/PROGRESS.md` | **NEW** — the running record: what was run, what it showed, what is next |
+| `V3_STRING/LADDER_AUDIT.md` | **NEW** — every finding of the theory-vs-implementation audit of the first ladder |
 
 **Frozen — never edit:** `app/vjepa_2_1/` and `src/`. `src/hub/backbones.py:227`
 imports `app.vjepa_2_1.models` and loads `strict=True`; the ek100 eval imports it
@@ -215,12 +229,28 @@ model:
   pred_ffn_type: null                # same, for the predictor
   norm_type: null                    # layernorm | dyt | derf                 (§9.2)
   norm_out_type: null                # output norms only; follows norm_type
+loss:
+  reg_type: null                     # sigreg | visreg, added to the loss       (§9.7)
+  reg_weight: 0.0                    # must be > 0 when reg_type is set
+  reg_num_slices: 1024               # random 1-D projections per step
+  reg_max_tokens: 4096               # tokens sampled per step
+data:
+  persistent_workers: false          # read since Nov 2026 (§6); 2.1 ignored it
 meta:
   sigreg_diag_freq: 0                # isotropy reading every N iters; 0 = off (§9.3)
+  pretrained_encoder: null           # path of a released 2.1 file              (§9.8)
+  pretrained_encoder_key: ema_encoder  # target_encoder for ViT-g/G and our own files
 optimization:
   lambda_warmup_frac: null           # [start, end] fractions of the run; null = 2.1's
                                      # fixed 15,000 -> 30,000 iterations (§6, §9.5)
+  clip_grad: null                    # max global gradient norm; null = none, as in 2.1
+  freeze_encoder_iters: 0            # encoder takes no step for N iterations   (§9.8)
+  encoder_lr_scale: 1.0              # encoder lr as a multiple of the schedule (§9.8)
 ```
+
+Every key above defaults to V-JEPA 2.1's behaviour. With all of them at the
+default, the v3 training loop produces the same checkpoint as the 2.1 loop,
+bit for bit (`tests/train/test_vjepa3_train_loop.py`).
 
 `null` on the four new `model:` keys means "V-JEPA 2.1 behaviour" and takes the
 unmodified code path, not an equivalent re-implementation of it.
@@ -282,9 +312,13 @@ hop is missed, the knob stops moving the output and the test fails.
 | `interpolate_rope` divides by `(H_patches - 1)` → ZeroDivisionError on a 1-patch input. | Carried over, out of scope. |
 | With `img_data` set and one rank, `int(world_size * img_rank_ratio)` is 0 and `img_total_batch_size % img_world_size` raises a bare `ZeroDivisionError` — so the stock configs cannot start on a single GPU. | **FIXED (message only)** — a `ValueError` explains that images and video train on disjoint ranks and points at the video-only proxy config. Joint training on one GPU is still not supported. |
 | `n_registers` creates **no register tokens** anywhere (no parameter, no concatenation). It only tells RoPE to leave the last `n` tokens unrotated — and on the encoder the rotary table is still built for the full grid, so `n_registers > 0` raises a shape error in the forward pass. | **DOCUMENTED, not fixed** — pinned by `TestRegistersAreNotImplemented` on both trees. Do not use it as an ablation arm; real registers would be new work (§7). |
-| `_rescale_blocks` divides `mlp.fc2.weight` by `sqrt(2·layer)`. For the MLP that is the output projection; for `SwiGLUFFN` `fc2` is the *gate-input* projection and the output (`fc3`) is left unscaled. | Carried over unchanged so `ffn_type: swiglu` stays bitwise equal to 2.1's `use_silu`. All GLU arms share it, so they remain comparable to each other; it is a confound when comparing GLU against the MLP arms. |
-| The context ("dense") loss weight warms up between **fixed** iterations 15,000 and 30,000 (`Lambda_LinearWarmupHold` defaults; no config key). That is 5%–10% of the 300,000-iteration paper recipe, but on a short run it lands late or never: a 30,000-iteration run reaches full weight on its last step, a 9,000-iteration run trains with the context loss off throughout. | **FIXED (opt-in)** — `optimization.lambda_warmup_frac: [0.05, 0.1]` places the warm-up at the same fraction of any run length. Unset, the 2.1 iterations are used unchanged. The proxy base sets it; `TestContextLossWarmup` fails if it is removed. `train.py` logs the resolved iterations at start-up. |
+| `_rescale_blocks` divides `mlp.fc2.weight` by `sqrt(2·layer)`. For the MLP that is the output projection; for `SwiGLUFFN` `fc2` is the *value* branch (the gate input is `fc1`) and the output (`fc3`) is left unscaled. | Carried over unchanged so `ffn_type: swiglu` stays bitwise equal to 2.1's `use_silu`. All GLU arms share it, so they remain comparable to each other; it is a confound when comparing GLU against the MLP arms. |
+| The context ("dense") loss weight warms up between **fixed** iterations 15,000 and 30,000 (`Lambda_LinearWarmupHold` defaults; no config key). That is 5%–10% of upstream's 300,000-iteration config (the paper reports 135,000 + 12,000), but on a short run it lands late or never: a 30,000-iteration run reaches full weight on its last step, a 9,000-iteration run trains with the context loss off throughout. | **FIXED (opt-in)** — `optimization.lambda_warmup_frac: [0.05, 0.1]` places the warm-up at the same fraction of any run length. Unset, the 2.1 iterations are used unchanged. The proxy base sets it; `TestContextLossWarmup` fails if it is removed. `train.py` logs the resolved iterations at start-up. |
 | `meta: eval_freq` is in every config and read by nothing. | Carried over; listed in `KNOWN_DEAD_META_KEYS` so the meta-key test still catches new orphans. |
+| `data: persistent_workers` is in every config and read by nothing, so the loader respawns all workers each time the data runs out (about 110 s per refill on the proxy recipe, 19 times a run). | **FIXED (opt-in)** — `train.py` reads the key and passes it on; absent or `false` is the old behaviour. The proxy base sets `false` on purpose: the first ladder ran that way, and kept-alive workers draw a different augmentation and mask stream. Not yet exercised with `true` on the server. |
+| Checkpoints are written in place and a failed write is only logged, so a crash or a full disk mid-write leaves a truncated `latest.pth.tar` and the run can end "successfully" with nothing to resume from. | **FIXED** — written to `<name>.tmp` and renamed (atomic); a failed write of the final checkpoint raises. |
+| `app/main.py` starts its worker processes and returns 0 whatever happens to them, so a shell loop over configs carries on after a crashed run. | **FIXED** — the launcher waits for every rank and exits 1 if any failed. |
+| The cooldown configs ship four Gram-loss keys (`computing_gram_loss`, `gram_HighRes`, `gram_ckpt`, `gram_loss_weight`) and `loss: reg_coeff`; the released `train.py` has no Gram loss and reads none of them. | Carried over; listed in `KNOWN_DEAD_LOSS_KEYS` so the loss-key test still catches new orphans. |
 
 ---
 
@@ -307,17 +341,23 @@ hop is missed, the knob stops moving the output and the test fails.
   `app.vjepa_3.models`, new `configs/eval_3/`, and a `use_v3` branch in
   `vit_encoder_predictor_concat_ar.py:37-42`. **Do this before trusting any
   ablation number.**
-- **A real run of `train.py`.** `main()` has never executed end to end on
-  this machine (`decord`, `webdataset`, `submitit`, `braceexpand` are not
-  installed, and there is no GPU). Everything in this guide is verified at the
-  model/unit level. The diagnostic hook in the training loop, the single-rank
-  guard, and the proxy config's batch size and schedule are therefore
-  **unexecuted**; expect to fix small things on the first launch.
+- **CUDA / float16 coverage in tests.** `train.main()` now runs end to end in
+  the test suite, but on CPU in float32. The float16 + GradScaler path is
+  exercised only by the real runs on the server (seven finished; see
+  `PROGRESS.md`). The regulariser, warm-start, clipping and
+  `persistent_workers: true` paths have **not** run on the GPU yet.
+- **Learnable RoPE frequencies** (RoPE-Mixed) — the audit's suggested
+  replacement for the STRING arm, whose learned basis adds no capacity while
+  the frequencies stay frozen (audit S-01, S-02). Not built.
+- **A norm-free arm that can train** — `n1-dyt` collapsed. A fair retest needs
+  an initialisation that does not rely on LayerNorm for its starting scale
+  (audit N-09), float32 or clipping, and a pre-flight pass (§9.9). Not built;
+  `clip_grad` and `norm_out_type: layernorm` exist as ingredients.
+- **A projector for the regulariser** — both papers regularise the output of
+  a projector MLP, not the backbone features (§9.7).
+- **Exact resume** — a resumed run differs from an uninterrupted one at the
+  level of a different seed, because RNG state is not checkpointed (audit L-08).
 - **Real register tokens** — see the `n_registers` row in §6.
-- **SIGReg as a loss term** — only the reading is built (§9.3). H-JEPA found a
-  marginal regulariser alone lets video models keep the background and drop
-  the moving agent, so a loss version would have to sit alongside the EMA
-  target, as a separate arm.
 - **ViT-5 stabilisers** (LayerScale, QK-norm) — not built; recorded as the next
   candidates if the FFN/norm arms prove uninteresting.
 - **e-means beyond the probe** — data curation or cluster-prediction targets.
@@ -331,11 +371,12 @@ hop is missed, the knob stops moving the output and the test fails.
 ## 8. Verify
 
 ```bash
-python3 -m pytest tests/models/ tests/distributed/ tests/probes/ -v
+python3 -m pytest tests/ -q
 python3 scripts/make_ladder_configs.py --check
 ```
 
-141 pass, 4 skip (3 CUDA-gated, 1 needs Faiss ≥ 1.16). CPU only, ~25s.
+243 pass, 4 skip (3 CUDA-gated, 1 needs Faiss ≥ 1.16). CPU only, about 90 s
+(40 s of that is one test: the v3 loop against the 2.1 loop on ViT-L).
 
 `vit_tiny` is `embed_dim=192 / num_heads=3 ⇒ head_dim=64` — the **same**
 `head_dim` as ViT-L (1024/16) and ViT-g (1408/22), so `d_dim=h_dim=w_dim=20`
@@ -354,6 +395,11 @@ exactly. Do not widen it.
 | `test_vjepa3_diagnostics.py` | equals LeJEPA Algorithm 1; Gaussian sits at the floor for any N; collapsed / mis-scaled / shifted / low-rank / heavy-tailed inputs score ≥ 20× the floor; immune to autocast |
 | `tests/probes/test_tracking_probe.py` | J and F against closed-form cases; label propagation tracks a synthetic object and loses it when the features carry no signal; frame/clip feature extraction keeps token order; `main()` end to end on a synthetic DAVIS-layout folder with a saved checkpoint, and a mismatched checkpoint is refused |
 | `tests/probes/test_cluster_probe.py` | purity and NMI against hand-computed values; k-means recovers separated blobs; the probe passes exactly the encoder kwargs the training path does; checkpoints load `strict=True` and a mismatched architecture is refused |
+| `test_vjepa3_regularizers.py` | SIGReg equals the logged reading divided by N; VISReg equals the paper's listing; each term responds to its own failure (scale, centre, heavy tails); the stop-gradient on the scale is present; gradients are finite under exact collapse; half-configured settings raise |
+| `test_vjepa3_pretrained.py` | the architecture built for a released ViT-B equals the one Meta's loader builds (158 tensors); the warm-start arms build it too and the FFN/norm arms do not; loading is strict and `weights_only` |
+| `tests/train/test_vjepa3_train_loop.py` | the real `train.main()`: defaults ≡ the 2.1 loop bitwise; each regulariser trains, is logged, and touches only the encoder; warm start, freeze, lr scale and resume; gradient clipping; atomic checkpoints and a fatal failed final save; `persistent_workers` reaches the loader |
+| `tests/train/test_launcher.py` | `app/main.py` exits non-zero when a rank crashes |
+| `tests/scripts/test_ladder_tools.py` | the comparison tool resamples by video and needs both noise sources cleared before calling an arm "clear"; the pre-flight check flags `n1-dyt` and passes healthy arms |
 | `test_vjepa3_ddp_static_graph.py` | STRING — alone, and combined with SwiGLU + Derf + per-axis RoPE base in training mode — trains across a T=1 rank and a T=8 rank under `static_graph=True`, **with a negative control that must fail** |
 
 ### On negative controls
@@ -423,9 +469,11 @@ derf   weight · erf (alpha · x + shift) + bias     alpha = 0.5, shift = 0
 - `norm_out_type` replaces the output norms: the encoder's four
   deep-supervision norms and the predictor's final norm. It follows `norm_type`
   unless set. It is a separate key because those outputs feed the loss: the
-  predictor regresses onto LayerNorm-standardised targets, and neither paper
-  tested a bounded output layer in that position. If `n1-dyt` or `n2-derf`
-  trains badly, `norm_out_type: layernorm` is the first thing to try.
+  predictor regresses onto LayerNorm-standardised targets. (DyT's MAE
+  experiment does replace the output norm before a regression head; Derf
+  reports no such case.) `n1-dyt` collapsed in the first ladder (`PROGRESS.md`);
+  `norm_out_type: layernorm` alone is not expected to fix that, because the
+  cause is the starting scale inside the blocks (audit N-09).
 - The `F.layer_norm` calls in `train.py` standardise the *targets*. They are
   part of the loss and are never replaced.
 
@@ -490,21 +538,39 @@ python -m evals.main --fname configs/eval_3/vitb16/cluster-probe.yaml --devices 
 the ViT-B recipe. `scripts/make_ladder_configs.py` generates one config per
 arm from it; its `ARMS` table is the definition of the ladder.
 
-| Arm | Changes vs `a0-control` | Warm start from 2.1 |
-|---|---|---|
-| `a0-control` | nothing | yes |
-| `p1-theta100` | `rope_theta: 100.0` | yes |
-| `p2-theta-temporal` | `rope_theta: [100, 10000, 10000]` | yes |
-| `p3-string` | `use_string: true` | yes |
-| `f1-swiglu` | `ffn_type`, `pred_ffn_type: swiglu` | **no** |
-| `f2-relu2` | `ffn_type`, `pred_ffn_type: relu2` | **no** |
-| `n1-dyt` | `norm_type: dyt` | **no** |
-| `n2-derf` | `norm_type: derf` | **no** |
+| Arm | Changes vs the base | Encoder loadable from a 2.1 file | Compare with |
+|---|---|---|---|
+| `a0-control` | nothing | yes | – |
+| `p1-theta100` | `rope_theta: 100.0` | yes | `a0-control` |
+| `p2-theta-temporal` | `rope_theta: [100, 10000, 10000]` | yes | `a0-control` |
+| `p3-string` | `use_string: true` | yes | `a0-control` |
+| `f1-swiglu` | `ffn_type`, `pred_ffn_type: swiglu` | **no** | `a0-control` |
+| `f2-relu2` | `ffn_type`, `pred_ffn_type: relu2` | **no** | `a0-control` |
+| `n1-dyt` | `norm_type: dyt` | **no** | `a0-control` |
+| `n2-derf` | `norm_type: derf` | **no** | `a0-control` |
+| `s1-sigreg` | `loss.reg_type: sigreg`, `reg_weight: 0.1` | yes | `a0-control` |
+| `s2-visreg` | `loss.reg_type: visreg`, `reg_weight: 0.05` | yes | `a0-control` |
+| `w0-warm-control` | released ViT-B encoder, 900 frozen iterations, encoder lr ×0.1 | yes | – |
+| `w2-warm-theta-temporal` | `w0` + `rope_theta: [100, 10000, 10000]` | yes | `w0-warm-control` |
+
+"Loadable" says the arm keeps the encoder's parameters. Only the `w` arms
+actually start from a released file; every other arm trains from scratch.
+Results of the first eight are in [PROGRESS.md](PROGRESS.md).
 
 ```bash
 python3 scripts/make_ladder_configs.py            # regenerate after editing the base or ARMS
-python -m app.main --fname configs/train_3/ladder/n2-derf.yaml --devices cuda:0
+python3 scripts/preflight_arm.py configs/train_3/ladder/s1-sigreg.yaml   # before the GPU (§9.9)
+
+# on the training machine: copies with real paths, in a folder git ignores
+python3 scripts/make_ladder_configs.py --local configs/train_3/local \
+    --folder-root /runs/pretrain_3/ladder --data /data/train_paths.csv
+python -m app.main --fname configs/train_3/local/s1-sigreg.yaml --devices cuda:0
 ```
+
+`--seed N` with `--local` writes every arm again as `<arm>-seedN` with
+`meta.seed: N`, for repeat runs. The tracked files keep placeholder paths;
+never edit them by hand (the first ladder did, and the edited copies could not
+be audited: audit L-25).
 
 Rules for reading the results:
 
@@ -516,7 +582,7 @@ Rules for reading the results:
 2. **The base is a screening recipe; freeze it across arms.** Values marked
    `SCREEN` in the base were set from measurements on one Quadro RTX 8000
    (its header lists each one and why): `float16`, activation checkpointing
-   off, 30 epochs (9,000 iterations, ~3.5 h per arm), `lambda_warmup_frac`
+   off, 30 epochs (9,000 iterations, about 5 h per arm as measured), `lambda_warmup_frac`
    so the context loss is on for 90% of the run, and an untuned `lr` of
    2e-4. A 9,000-iteration run ranks arms; it can under-rate a change that
    only pays off late, so checkpoints are kept at epochs 10/20/30 to see
@@ -525,7 +591,9 @@ Rules for reading the results:
 3. **One seed is one sample.** On short proxy runs, differences of the size
    reported in the papers above (a few tenths of a point) are well inside
    seed noise. Re-run the control with a second seed before believing any
-   arm that wins by a small margin.
+   arm that wins by a small margin, and read scores through
+   `scripts/compare_tracking.py` (§9.9), which reports both the test-set
+   range and the gap between controls.
 4. **Then the preset.** Put the winning arm names in `PRESET` and regenerate;
    `ladder/modded.yaml` is written as the union of their overrides, and the
    script refuses arms that set the same key differently.
@@ -564,7 +632,102 @@ python -m evals.video_tracking_frozen.eval --run <run folder> --davis <DAVIS roo
   not DAVIS's.
 - It reads the architecture from the run's `params-pretrain.yaml` and loads
   `target_encoder` with `strict=True`, like the clustering probe.
-- **Not yet done:** a run on the real DAVIS set or a trained checkpoint, and
-  a cross-check of J and F against the official `davis2017-evaluation`
-  toolkit. The metric code follows the toolkit's definitions and is tested on
-  closed-form cases only.
+- **`--released <file> --out <folder>`** scores one of Meta's released
+  V-JEPA 2.1 encoders instead of a run of ours (the file keeps its released
+  name, e.g. `vjepa2_1_vitb_dist_vitG_384.pt`). This is the yardstick check:
+  the paper reports 67.0 for that model, and our protocol differs slightly
+  (audit L-18), so the number tells us how far this probe sits from the
+  paper's. Not yet run.
+- **Status:** run on the real DAVIS 2017 val set for seven trained arms
+  (`PROGRESS.md`). The audit checked J and F against a reference copy of the
+  official metrics on 180 mask pairs and the propagation against DINO's
+  (L-16, L-17). Still open: the installed official toolkit on real
+  predictions, and `--mode clip` at full size on the GPU.
+
+### 9.7 Regularisers on the loss (`loss.reg_type`)
+
+V-JEPA has no loss term that forbids collapse. LeJEPA's SIGReg and VISReg add
+one: both pull the embedding distribution toward an isotropic Gaussian through
+many random 1-D projections. `app/vjepa_3/regularizers.py` implements both as
+an **addition** to the existing loss:
+
+```
+loss = L_pred + λ·L_ctx + reg_weight · L_reg(encoder tokens)
+```
+
+How this differs from the papers, and why:
+
+| | Papers | Here |
+|---|---|---|
+| EMA teacher | removed | **kept**. Our H-JEPA notes record that a marginal regulariser alone lets a video model keep the background and drop the moving object |
+| What is regularised | one pooled vector per image, after a projector MLP | **patch tokens** of the context encoder's last output level, no projector. A batch is 16 clips: too few vectors to shape a distribution |
+| Samples per step | 128–512 images (VISReg loses 2 points going from 512 to 128) | up to 4,096 tokens, drawn across the batch. Tokens of one clip are not independent; neither paper tested that |
+| Weight | about 10× the prediction loss | first guesses, set so each regulariser adds about a third of the main loss's gradient on the encoder at the first step (SIGReg 0.1, VISReg 0.05; measured with §9.9 on synthetic clips) |
+| SIGReg value | multiplied by the sample count N | **not** multiplied, so a weight means the same at any token count. Reference values: 0 Gaussian, 0.41 all tokens at one point, 0.82 spread far too wide |
+
+`<folder>/reg_r0.csv` logs the main loss and the regulariser separately at
+every iteration; `loss` in `log_r0.csv` is their weighted sum and is not
+comparable with an arm that has no regulariser.
+
+What to expect, from what we have measured: the baseline's features are far
+from the target in *offset and per-dimension scale* (`sigreg_raw` ≈ 0.4 per
+sample) but close in *shape* (`sigreg_std` ≈ 0.007). So the regulariser will
+mostly centre and rescale the dimensions. Across the six healthy arms of the
+first ladder the isotropy reading showed no relation to the tracking score
+(`PROGRESS.md`), so a gain in tracking is a hypothesis, not an expectation.
+The papers' own dense-feature result is their stated weak spot (VISReg: 30.2
+mIoU on ADE20K against MoCo v3's 31.7).
+
+### 9.8 Starting from a released encoder (`meta.pretrained_encoder`)
+
+The first ladder trains ViT-B from scratch on 7,400 videos and reaches a
+tracking score of 35; the paper's distilled ViT-B scores 67. To test a change
+on top of a model that already works:
+
+```yaml
+meta:
+  pretrained_encoder: /ckpt/vjepa2_1_vitb_dist_vitG_384.pt
+optimization:
+  freeze_encoder_iters: 900     # predictor trains alone first
+  encoder_lr_scale: 0.1         # then the encoder moves slowly
+```
+
+- **Only the encoder is loaded.** The released ViT-B was distilled from ViT-G
+  and its predictor outputs the teacher's 1664-wide features at one level; the
+  loop here predicts the encoder's own width at four levels. So the predictor
+  starts untrained, which is what the two guards are for. The distillation
+  loop itself is not in the released code.
+- **The encoder fits exactly**: 158 of 158 tensors with the same shapes as
+  the encoder the proxy recipe builds, for every arm that keeps the encoder's
+  parameters (`test_vjepa3_pretrained.py`).
+- **A different question from the first ladder.** These runs continue a
+  distilled model with a self-supervised objective. `w0-warm-control` exists
+  to answer the first question: does the score survive that at all? Run and
+  score it before any other `w` arm. If it does not hold, the guards (both
+  first guesses) need tuning before the family means anything.
+- **Not verified:** no released file has been opened by this code. The key
+  names come from Meta's own loader (`src/hub/backbones.py`).
+
+### 9.9 Two tools: check before the GPU, compare after
+
+```bash
+python3 scripts/preflight_arm.py configs/train_3/ladder/<arm>.yaml
+```
+
+runs one real training step of the arm and of the control on identical
+synthetic clips (CPU, about 10 s per arm at ViT-B) and compares the gradient
+each produces. `n1-dyt`, which collapsed after five GPU-hours, fails this in
+one step: its encoder gradient is about 50 times smaller than the control's
+and a third of its elements are below Adam's epsilon. A PASS means "starts in
+the same regime as the control", nothing more: one step, float32, synthetic
+data.
+
+```bash
+python3 scripts/compare_tracking.py --runs <runs folder> \
+    --control a0-control --control a0-control-s2 [--mode clip]
+```
+
+prints each arm's tracking score against the control with a 95% range from
+resampling the 30 test videos, and the gap between the two controls as the
+training-noise yardstick. An arm is marked "clear" only when its range
+excludes zero **and** its difference exceeds that gap.
