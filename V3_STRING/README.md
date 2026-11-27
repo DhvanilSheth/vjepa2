@@ -557,6 +557,8 @@ arm from it; its `ARMS` table is the definition of the ladder.
 | `n2-derf` | `norm_type: derf` | **no** | `a0-control` |
 | `s1-sigreg` | `loss.reg_type: sigreg`, `reg_weight: 0.1` | yes | `a0-control` |
 | `s2-visreg` | `loss.reg_type: visreg`, `reg_weight: 0.05` | yes | `a0-control` |
+| `n3-dyt-sigreg` | `norm_type: dyt` + SIGReg at 0.1 | no | `a0-control`, `n1-dyt`, `s1-sigreg` |
+| `n4-derf-sigreg` | `norm_type: derf` + SIGReg at 0.1 | no | `a0-control`, `n3-dyt-sigreg` |
 | `t1-future` | `mask.0.max_temporal_keep: 0.5` (§9.10) | yes | `a0-control` |
 | `t2-fps12` | `data.fps: 12` (§9.10) | yes | `a0-control` |
 | `t3-frames` | `mask.0.hide_time_steps: 6` (§9.10) | yes | `a0-control` |

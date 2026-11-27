@@ -1,6 +1,6 @@
 # V-JEPA 3: progress record
 
-Last updated: 2026-11-26.
+Last updated: 2026-11-27.
 
 This file tracks what has been done, what it showed, and what comes next.
 Details live elsewhere: [README.md](README.md) explains the code and every
@@ -32,9 +32,10 @@ The plan has four steps:
 | First ladder: eight 5-hour runs on the server | 7 finished; `n2-derf` stopped at epoch 3 on evidence |
 | Tracking scores, single-frame mode | done for the 7 finished runs |
 | Audit of theory against implementation | done; no implementation bug in any arm |
-| Second control run (training noise) | **running** (`a0-control-s2`, seed 1239) |
-| Tracking scores, 16-frame mode | **not started**; never run at full size on the GPU |
-| Ranking against noise | waiting on the two rows above |
+| Second control run (training noise) | done 2026-11-27 (`a0-control-s2`, seed 1239): **32.3**, which is 2.6 points below `a0-control` |
+| Meta's released ViT-B scored with our test | done 2026-11-27: **68.9** (paper: 67.0) |
+| Tracking scores, 16-frame mode | done 2026-11-27 for the 7 healthy runs; it fits in memory |
+| Ranking against noise | done 2026-11-27: no change is separable from training noise; `n1-dyt` is clearly worse (section 4) |
 | Second round built: regularisers, released-encoder start, tools, fixes | done, pushed (`cbd11a0`) |
 | Time-focused arms (future prediction, 12 fps, whole-frame masks, whole-clip use), from scratch and on the released encoder | done, pushed; 259 tests pass |
 | Second round run | not started |
@@ -66,8 +67,44 @@ are resampled. It covers test-set noise only.
 | `f1-swiglu` | SwiGLU feed-forward | 33.9 | −1.0 | −2.1 to +0.3 | 19 / 42 | no evidence of a gain; different start from the control |
 | `p3-string` | Cayley-STRING learned basis | 33.5 | −1.4 | −2.6 to −0.4 | 24 / 37 | worse; and adds no capacity (audit S-01) |
 | untrained encoder | – | 28.1 | −6.8 | – | – | the floor of this test |
+| Meta's released ViT-B, as released | – | 68.9 | +34.0 | – | – | the ceiling we can see; paper reports 67.0 |
 | `n1-dyt` | Dynamic Tanh for LayerNorm | 18.7 | −16.2 | −20.3 to −12.4 | 3 / 58 | collapsed |
 | `n2-derf` | Dynamic erf for LayerNorm | – | – | – | – | stopped at epoch 3 with `n1-dyt`'s early signature |
+
+Meta's released ViT-B (2026-11-27, single-frame mode): J&F 68.9 (J 66.0, F
+71.9); small objects 47.3, medium 71.2, large 78.7. Our from-scratch control
+scores about 10 / 30 / 50 on the same three groups. Two things follow: our
+test agrees with the paper to within 2 points, so it can be trusted as a
+yardstick; and the loader for released files works on a real file.
+
+### Ranking against training noise (2026-11-27)
+
+The second control, same config with seed 1239, scored 32.3 in single-frame
+mode and 32.4 in 16-frame mode. The gap between the two controls is 2.6
+points in both modes. This is one pair of runs, so 2.6 is itself a rough
+estimate. `scripts/compare_tracking.py` verdicts, each arm against
+`a0-control`:
+
+| Run | Single-frame | vs control | 16-frame | vs control | 95% range (16-frame) | Verdict |
+|---|---|---|---|---|---|---|
+| `p2-theta-temporal` | 35.2 | +0.3 | 35.9 | +0.9 | −0.1 to +2.0 | not separable |
+| `f2-relu2` | 36.2 | +1.4 | 35.5 | +0.5 | −0.8 to +1.7 | inside training noise |
+| **`a0-control`** | **34.9** | – | **35.0** | – | – | – |
+| `p1-theta100` | 34.2 | −0.6 | 34.5 | −0.5 | −1.9 to +0.8 | not separable |
+| `p3-string` | 33.5 | −1.4 | 34.1 | −0.9 | −2.1 to +0.0 | inside training noise |
+| `f1-swiglu` | 33.9 | −1.0 | 33.1 | −1.9 | −3.4 to −0.4 | inside training noise |
+| `a0-control-s2` | 32.3 | −2.6 | 32.4 | −2.6 | – | the noise yardstick |
+| `n1-dyt` | 18.7 | −16.2 | not run | – | – | clear: worse |
+
+Two readings:
+
+- **No change in the first ladder is kept or dropped on its score.** Every
+  healthy arm sits inside the gap between two runs of the unchanged model.
+  `n1-dyt` and `n2-derf` are dropped because they collapse.
+- **Showing the model 16 frames instead of one does not help it track.** Every
+  run scores the same in both modes to within a point. These from-scratch
+  models make no visible use of time, which is the gap the time-focused arms
+  (section 8) are aimed at.
 
 Health of the runs (server checks, `LADDER_AUDIT.md` section 4):
 
@@ -95,15 +132,18 @@ relation to the score among the six healthy runs.
 3. **STRING, as built, cannot add anything.** With frozen frequencies its
    learned basis folds exactly into the attention weights. It tested
    optimisation only, and came out slightly worse.
-4. **The screen catches breakages but cannot rank small gains.** It can detect
-   effects of about 1.5 points. Published gains for these changes are about
-   0.5 points on image classification.
+4. **The screen catches breakages but cannot rank small gains.** Two runs of
+   the unchanged model differ by 2.6 points, so a single run per arm can only
+   show effects of about 3 points or more. Published gains for these changes
+   are about 0.5 points on image classification.
 5. **Most of the first ladder was not aimed at the goal.** Five of seven
    changes are generic network tweaks. Only the two RoPE changes touch time,
    and single-frame mode cannot see time.
-6. **`f2-relu2` is the one result worth a second look.** It is the cleanest
-   comparison (it starts from the control's exact weights). With six
-   comparisons, one result of this size appearing by luck is not unusual.
+6. **`f2-relu2` did not hold up.** Its +1.4 in single-frame mode is inside
+   training noise and falls to +0.5 in 16-frame mode. No second seed is
+   planned for it.
+7. **The from-scratch models do not use time.** 16-frame mode scores the same
+   as single-frame mode for every run (section 4).
 
 ## 6. Known limits of the screen
 
@@ -111,7 +151,7 @@ These apply to every number in section 4.
 
 | Limit | Consequence | What addresses it |
 |---|---|---|
-| One run per arm; two runs of the same config are not identical (audit L-06) | Training noise is unknown | `a0-control-s2` (running); more seeds with `--seed` |
+| One run per arm; two runs of the same config are not identical (audit L-06) | Training noise measured once: 2.6 points between two controls | More seeds with `--seed` before believing any gap under about 3 points |
 | 30 test videos; single videos swing by 20 points between runs | A 1-point gap can come from one or two videos | `scripts/compare_tracking.py` resamples by video |
 | The same 30 videos are used to choose between changes | Choices can fit this test set rather than tracking in general | Few comparisons; a second seed before believing a win; a held-out benchmark before any claim (not chosen yet) |
 | 7,376 training videos, seen about 20 times each | The screen measures learning from little data; a ranking may not hold at scale | The long confirming run; the released-encoder family (section 7) |
@@ -130,6 +170,7 @@ the default, the training loop still produces the same checkpoint as Meta's
 |---|---|---|
 | `s1-sigreg` | SIGReg (LeJEPA) added to the loss, on the encoder's patch tokens | `a0-control` |
 | `s2-visreg` | VISReg added the same way | `a0-control` |
+| `n3-dyt-sigreg`, `n4-derf-sigreg` | `n1-dyt` / `n2-derf` with SIGReg (added 2026-11-27) | `a0-control`, `n1-dyt` |
 | `t1-future` | Future prediction: for one of the two masks, the encoder sees only the first half of the clip | `a0-control` |
 | `t2-fps12` | Frames 12 per second instead of 4 (smaller movements between frames) | `a0-control` |
 | `t3-frames` | Whole moments hidden instead of regions: 6 of 8 time-steps hidden and predicted from the other 2 | `a0-control` |
@@ -240,27 +281,92 @@ today), and it only makes sense with time positions in seconds: positions are
 frame counts today, so at mixed rates the same gap would mean different
 amounts of real time.
 
+### 8.1 Masking by content, with real time (design in progress, 2026-11-27)
+
+Nothing in this subsection is built. It records the logic agreed so far.
+
+**Aim.** One masking rule that is correct for an image and for video at any
+frame rate, with difficulty rising over training. Time understanding is the
+aim; tracking is the yardstick.
+
+**Three kinds of hidden patch**, by where its content can be found:
+
+| Kind | Where its content is | What the model must do | Value |
+|---|---|---|---|
+| Copy | same place, another time, unchanged | nothing | none; with an absolute-error loss (`loss_exp: 1.0`) it pushes as hard as a hard patch, so it adds noise |
+| Follow | another time, a different place | find the same thing and carry it over | this is tracking |
+| Imagine | nowhere visible | infer it from the surroundings | teaches what objects are |
+
+V-JEPA's mask (same region for the whole clip) has no Copy, is mostly
+Imagine, and has Follow only where something crosses the mask's edge.
+
+**The rule.** Never ask for a patch that looks the same as a patch that is
+shown at the same place. Stated on pairs (shown patch, asked patch), so slow
+drift needs no grouping. Copy is then impossible for any amount of masking.
+A still place costs one shown patch however many frames sampled it, so extra
+frames from a high frame rate add nothing to ask about.
+
+**One description for every input.** A sample is a set of frames with real
+times in seconds; a patch is (time, place). An image is one frame: all time
+differences are zero, so the time axis has no effect, and every hidden patch
+is Imagine. Each frame is turned into tokens on its own.
+
+**Two dials, both scheduled over training progress.** `rho`: share hidden
+completely (Imagine), in large blocks; active for images and video. `G`: the
+longest time in seconds between a hidden changing patch and the nearest
+moment shown (Follow); no effect on images.
+
+**Earlier formulation, superseded.** A per-time-step hide fraction drawn from
+a Beta distribution and shuffled over time was checked numerically. Its
+"leak" (share of hidden patches whose place is visible at another time) was
+0.48 to 0.90 with the first-guess settings, against 0 for V-JEPA. That
+measure counted places, not content, and the design did not remove Copy.
+
+**Open items.** (1) Deciding "unchanged": in progress, see below. (2) A gap
+in seconds is not the whole difficulty; speed matters too. (3) Every clip in
+a batch must show the same number of tokens. (4) The one-GPU loop cannot mix
+images and video. (5) Single-frame tokens change the input layer for video.
+(6) DAVIS alone cannot judge time understanding; a direct test is needed.
+
+**Item 1, the change signal.** `scripts/measure_change.py` compares two
+frames patch by patch after three steps, each needed on synthetic scenes with
+a known answer: low-pass (noise), per-patch mean removal and gain fit
+(brightness), smallest difference over shifts of up to `tol` pixels (camera
+shake). Raw pixel difference fails: a 1-pixel shake (0.052) reads as more
+change than a real 8-pixel pan (0.039). Dividing by each patch's contrast
+also fails, because it amplifies noise in flat patches. On the synthetic
+scenes the working signal separates the two groups by a factor of about 2,
+which is too narrow to fix a threshold without real video. Next: run the
+script on DAVIS on the server.
+
 ## 9. Next steps, in order
 
-1. **Server:** let `a0-control-s2` finish, then score it in single-frame mode.
-2. **Server:** run 16-frame mode on `a0-control` as a memory check, then on
-   every finished run.
-3. **Here:** rank the first ladder with `compare_tracking.py` and give a keep
-   or drop verdict per change.
-4. **Decide:** commit and push the second round, pull it on the server.
-5. **Server:** download Meta's ViT-B file and score it with `--released`. This
-   tells us whether our test agrees with the paper's 67.
-6. **Server:** run `s1-sigreg` and `s2-visreg` (about 5 h each). Check
-   `reg_r0.csv` after the first epoch.
-7. **Server:** run `w0-warm-control` and score it. Only if the score holds,
-   run the time-focused arms on it, in this order: `w6-warm-whole-clip`,
-   `w5-warm-frames`, `w3-warm-future`, `w4-warm-fps12`, then
-   `w2-warm-theta-temporal`. If it does not hold, run the from-scratch twins
-   `t4-whole-clip`, `t3-frames`, `t1-future`, `t2-fps12` instead. Score all of
-   these in 16-frame mode.
-8. **Server, only if `f2-relu2` is still ahead after step 3:** repeat it with
-   a second seed.
-9. Combine the winners (`PRESET` in `make_ladder_configs.py`) and do one long
+Steps done on 2026-11-27: second control scored, 16-frame mode run on every
+healthy run, first ladder ranked (section 4), Meta's ViT-B scored.
+
+1. **Server:** score Meta's ViT-B in 16-frame mode, if not done.
+   Also run `python scripts/measure_change.py --davis <DAVIS>` (CPU only,
+   a few minutes) and send the output; it settles item 1 of section 8.1.
+2. **Server:** write local configs with `--pretrained`, then run this chain
+   (about 5 h each): `w0-warm-control`, `t4-whole-clip`, `t3-frames`,
+   `t1-future`, `t2-fps12`.
+3. **Server:** score `w0-warm-control` at `e9.pth.tar` and at the end. If it
+   stays near Meta's 68.9, run the arms on the released encoder:
+   `w6-warm-whole-clip`, `w5-warm-frames`, `w3-warm-future`, `w4-warm-fps12`,
+   `w2-warm-theta-temporal`. If it drops, tune `freeze_encoder_iters` and
+   `encoder_lr_scale` first.
+4. **Here:** read the time-focused arms in 16-frame mode against both
+   controls. An arm counts only if it beats `a0-control` by more than the 2.6
+   point gap; anything that does gets a second seed.
+5. **Server, later:** `s1-sigreg` and `s2-visreg`. Check `reg_r0.csv` after
+   the first epoch.
+   Then `n3-dyt-sigreg`, only if `s1-sigreg` is healthy. Pre-flight on
+   2026-11-27 (one step, float32, synthetic clips): SIGReg lifts the encoder
+   gradient of the DyT model from 0.019x to 0.21x of the control's, but the
+   predictor gradient stays at 0.0002x, because SIGReg acts on the encoder
+   output only. The predictor's starting scale is a separate problem that
+   SIGReg does not address.
+6. Combine the winners (`PRESET` in `make_ladder_configs.py`) and do one long
    confirming run.
 
 ## 10. Server reference

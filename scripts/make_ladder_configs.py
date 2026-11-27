@@ -184,6 +184,16 @@ ARMS = {
         True,
         {"loss.reg_type": "visreg", "loss.reg_weight": VISREG_WEIGHT},
     ),
+    "n3-dyt-sigreg": (
+        "n1-dyt with SIGReg: tests whether an explicit anti-collapse term can stand in for LayerNorm.",
+        False,
+        {"norm_type": "dyt", "loss.reg_type": "sigreg", "loss.reg_weight": SIGREG_WEIGHT},
+    ),
+    "n4-derf-sigreg": (
+        "n2-derf with SIGReg. Compare with n3-dyt-sigreg and s1-sigreg.",
+        False,
+        {"norm_type": "derf", "loss.reg_type": "sigreg", "loss.reg_weight": SIGREG_WEIGHT},
+    ),
     "t1-future": (
         "Future prediction on mask 0: context from the first half of the clip only.",
         True,
