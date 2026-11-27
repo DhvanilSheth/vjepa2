@@ -336,8 +336,71 @@ shake). Raw pixel difference fails: a 1-pixel shake (0.052) reads as more
 change than a real 8-pixel pan (0.039). Dividing by each patch's contrast
 also fails, because it amplifies noise in flat patches. On the synthetic
 scenes the working signal separates the two groups by a factor of about 2,
-which is too narrow to fix a threshold without real video. Next: run the
-script on DAVIS on the server.
+which is too narrow to fix a threshold without real video.
+
+**Measured on DAVIS val (2026-11-27, 30 videos, shift tolerance 1 px).**
+
+- *No natural threshold.* At a 0.25 s gap the sizes of change form one
+  spread-out group, not two. "Unchanged" is a matter of degree.
+- *The signal lands on objects.* At 0.25 s and threshold 0.012, 28% of
+  background patches read as unchanged against 4% of object patches. In the 6
+  videos with a still camera (background changed in 1% to 30% of patches),
+  objects read as changed in 95% to 100%.
+- *Most DAVIS videos have a moving camera.* In 19 of 30, at least 75% of the
+  background reads as changed. The signal cannot tell camera motion from
+  object motion.
+- *Copy is a smaller share than assumed at our time scale.* About 19% of all
+  patches fall below 0.0105 at 0.25 s. At 1/24 s it is far larger: 50% of
+  background and 27% of object patches at threshold 0.012. So the rule
+  matters most at high frame rates.
+
+The earlier assumption "most of a video is still" does not hold on DAVIS.
+
+Re-run with a 3-pixel tolerance: the picture does not change. Background
+unchanged at 0.25 s rises only from 28% to 35%, and the same 19 videos stay at
+70% or more changed. So it is real camera motion, not hand-held drift.
+
+**Decision (2026-11-27): camera motion is not a target.** Mapping a camera's
+motion is a solved problem elsewhere (SLAM, 3D reconstruction), so the model's
+effort should go to things that move on their own. The rule becomes: never ask
+for a patch that looks the same as a shown patch at the same place *after
+undoing the camera's motion*. A still camera is the case of zero motion, so
+Copy and "explained by the camera" are one class. The kinds are then:
+explained by the camera (not asked), Follow (moves on its own), Imagine.
+
+**When both the camera and the object move.** Exact separation is not always
+possible from pixels: an object that fills the frame, an object moving along
+the camera's path, and a camera moving through depth are each ambiguous. The
+rule does not need the separation. It needs to know what is trivial to
+predict. So the definition adopted on 2026-11-27 is:
+
+- *Question asked of each patch:* is it explained by the one motion most of
+  the frame shares? If yes, it is not asked for.
+- *Soft, not yes or no:* a patch is asked for with a weight between 0 and 1,
+  in proportion to how much the shared motion fails to explain it. DAVIS
+  showed no natural threshold.
+
+| Case | Explained | Asked |
+|---|---|---|
+| Camera pans, small object moves | background | the object |
+| Object fills the frame, camera follows | the object's body | background, and parts that move differently |
+| Object moves along the camera's path | far background | the object and near still things |
+| Camera moves through depth | almost nothing | almost everything (today's behaviour) |
+| Water, leaves, crowds | nothing | all of it |
+
+Nothing trivial is ever asked, and the worst case equals today. What is not
+promised: that the asked patches are always the object. That needs depth.
+
+`scripts/measure_change.py` estimates the shared motion as one shift for the
+whole frame (`shared_shift`: coarse on the low-pass frames, then exact to the
+pixel; decided by the median) and measures change again after undoing it. It
+reports how many videos fall in each case, and on DAVIS whether the weight
+(`unexplained_weight`) lands on the annotated objects. A `--videos` mode
+samples the training videos, which have no masks. Not yet run on the server
+and not pushed. A single shift does not describe zoom, rotation or depth.
+
+`w0-warm-control` started on the server at 12:14 on 2026-11-27; its log
+confirms the encoder was initialised from Meta's file. Not yet scored.
 
 ## 9. Next steps, in order
 
