@@ -31,8 +31,9 @@ each frame has a hand-drawn mask of the moving objects, to answer:
 
 THE SIGNAL
 ----------
-`patch_change` compares two grayscale frames patch by patch, after three
-steps.  Each removes one way a patch can differ in pixels while showing the
+The signal lives in app/vjepa_3/change.py, because training uses the same
+functions.  `patch_change` compares two grayscale frames patch by patch, after
+three steps.  Each removes one way a patch can differ in pixels while showing the
 same thing; all three were needed on synthetic scenes with a known answer
 (tests/scripts/test_measure_change.py):
 
@@ -75,6 +76,13 @@ from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from app.vjepa_3.change import (  # noqa: E402,F401  (re-exported for the tests)
+    _shifted,
+    covered_patches,
+    patch_change,
+    shared_shift,
+    unexplained_weight,
+)
 from evals.video_tracking_frozen.davis import (  # noqa: E402
     read_annotation,
     read_sequences,
@@ -85,93 +93,6 @@ SIZE = 256  # frames are resized (short side) and centre-cropped to SIZE x SIZE
 PATCH = 16
 DAVIS_FPS = 24
 THRESHOLDS = (0.004, 0.006, 0.008, 0.012, 0.016, 0.024, 0.032)
-
-
-def _pool(frame, cell):
-    """[H, W] -> [H/cell, W/cell], the mean of each cell."""
-    h, w = frame.shape
-    return frame.reshape(h // cell, cell, w // cell, cell).mean((1, 3))
-
-
-def _per_patch(pooled, cells):
-    """[G*cells, G*cells] -> [G, G, cells, cells], each patch's mean removed."""
-    g = pooled.shape[0] // cells
-    patches = pooled.reshape(g, cells, g, cells).transpose(0, 2, 1, 3)
-    return patches - patches.mean((2, 3), keepdims=True)
-
-
-def _shifted(frame, dy, dx):
-    """`frame` moved by (dy, dx) pixels; the uncovered border repeats the edge."""
-    pad = max(abs(dy), abs(dx))
-    if pad == 0:
-        return frame
-    padded = np.pad(frame, pad, mode="edge")
-    h, w = frame.shape
-    return padded[pad - dy : pad - dy + h, pad - dx : pad - dx + w]
-
-
-def patch_change(a, b, patch=PATCH, cell=4, tol=1, gain=(0.8, 1.25)):
-    """How much each patch differs between two frames.
-
-    a, b: [H, W] grayscale in [0, 1], H and W multiples of `patch`.
-    Returns [H/patch, W/patch]; 0 means identical.  Units are grey levels on
-    the 0-1 scale, so 0.01 is about 2.5 of 255.
-    """
-    cells = patch // cell
-    pa = _per_patch(_pool(a, cell), cells)
-    energy = np.maximum((pa * pa).sum((2, 3), keepdims=True), 1e-8)
-    best = None
-    for dy in range(-tol, tol + 1):
-        for dx in range(-tol, tol + 1):
-            pb = _per_patch(_pool(_shifted(b, dy, dx), cell), cells)
-            g = np.clip((pa * pb).sum((2, 3), keepdims=True) / energy, *gain)
-            d = np.abs(pb - g * pa).mean((2, 3))
-            best = d if best is None else np.minimum(best, d)
-    return best
-
-
-def shared_shift(a, b, cell=4, reach=12):
-    """The (dy, dx) in pixels by which `b` must be moved to lie on `a`.
-
-    Coarse, then fine.  Coarse: every shift of up to `reach` cells is tried on
-    the low-pass frames.  Fine: every shift within one cell of that answer is
-    tried on the pixels, because a leftover of a few pixels would itself read
-    as change.  Each time the shift with the smallest MEDIAN difference wins,
-    so the larger part of the frame decides: a moving object does not, and
-    neither does the strip of repeated edge pixels a shift leaves behind
-    (under a fifth of the frame at the default `reach`).  Zero wins ties.
-    """
-
-    def best_shift(x, y, candidates):
-        best, winner = None, (0, 0)
-        for dy, dx in sorted(candidates, key=lambda s: abs(s[0]) + abs(s[1])):
-            score = np.median(np.abs(x - _shifted(y, dy, dx)))
-            if best is None or score < best:
-                best, winner = score, (dy, dx)
-        return winner
-
-    la, lb = _pool(a, cell), _pool(b, cell)
-    span = range(-reach, reach + 1)
-    cy, cx = best_shift(la - la.mean(), lb - lb.mean(), [(dy, dx) for dy in span for dx in span])
-    fine = range(-(cell - 1), cell)
-    return best_shift(
-        a - a.mean(), b - b.mean(), [(cy * cell + dy, cx * cell + dx) for dy in fine for dx in fine]
-    )
-
-
-def covered_patches(dy, dx, size=SIZE, patch=PATCH):
-    """[G, G] True for patches that lie fully inside the frame after it was
-    moved by (dy, dx): the rest contain repeated edge pixels."""
-    inside = np.zeros((size, size), bool)
-    inside[max(0, dy) : size + min(0, dy), max(0, dx) : size + min(0, dx)] = True
-    g = size // patch
-    return inside.reshape(g, patch, g, patch).all((1, 3))
-
-
-def unexplained_weight(change, full):
-    """Weight in [0, 1] for each patch: 0 where nothing changed, rising in
-    proportion, 1 from a change of `full` upwards."""
-    return np.clip(np.asarray(change) / full, 0.0, 1.0)
 
 
 WEIGHT_FULL = (0.016, 0.032, 0.064)  # candidate values of `full`

@@ -105,7 +105,8 @@ diff -r app/vjepa_2_1 app/vjepa_3 -x '__pycache__'
 | `diagnostics.py` | **NEW** — SIGReg / Epps-Pulley isotropy reading (§9.3) |
 | `regularizers.py` | **NEW** — SIGReg and VISReg as optional loss terms on the encoder's tokens (§9.7) |
 | `pretrained.py` | **NEW** — loading a released V-JEPA 2.1 encoder; what can and cannot be carried over (§9.8) |
-| `masks.py` | **NEW** — two options on a `mask:` entry: hide whole time-steps, and cut token lists at random instead of from the end of the clip (§9.10) |
+| `masks.py` | **NEW** — options on a `mask:` entry: hide whole time-steps, cut token lists at random instead of from the end of the clip (§9.10), and send a weight per hidden token (§9.11) |
+| `change.py` | **NEW** — how much of a hidden patch could simply be copied from a shown frame, and the weighted loss built from it (§9.11). Also used by `scripts/measure_change.py` |
 | `train.py` | 10 new `cfgs_model.get`, 3 new `cfgs_meta.get`; `EMBED_DIM_BY_MODEL_NAME` (§6); the diagnostic hook; single-rank guard (§6); the regulariser term (§9.7); encoder warm start, freeze and lr scale (§9.8); gradient clipping; atomic checkpoints and `persistent_workers` (§6) |
 | `utils.py` | 10 new `init_video_model` params; `init_opt` weight-decay exclusion (§4.3) |
 | `wrappers.py`, `transforms.py`, `patch_embed.py`, `pos_embs.py`, `masks_dist.py` | unchanged copies |
@@ -237,6 +238,8 @@ loss:
   reg_max_tokens: 4096               # tokens sampled per step
 mask:                                # per entry of the list              (§9.10)
 - hide_time_steps: 0                 # k > 0: hide k whole time-steps instead of blocks
+  target_weight: none                # unexplained: weight each hidden token (needs hide_time_steps > 0)
+  target_weight_full: 0.064          # the change that earns weight 1
   truncation: tail                   # random: use the whole clip evenly
   max_temporal_keep: 1.0             # 2.1 key; < 1: context from the start of the clip only
 data:
@@ -404,6 +407,7 @@ exactly. Do not widen it.
 | `test_vjepa3_regularizers.py` | SIGReg equals the logged reading divided by N; VISReg equals the paper's listing; each term responds to its own failure (scale, centre, heavy tails); the stop-gradient on the scale is present; gradients are finite under exact collapse; half-configured settings raise |
 | `test_vjepa3_pretrained.py` | the architecture built for a released ViT-B equals the one Meta's loader builds (158 tensors); the warm-start arms build it too and the FFN/norm arms do not; loading is strict and `weights_only` |
 | `tests/train/test_vjepa3_train_loop.py` | the real `train.main()`: defaults ≡ the 2.1 loop bitwise; each regulariser trains, is logged, and touches only the encoder; warm start, freeze, lr scale and resume; gradient clipping; atomic checkpoints and a fatal failed final save; `persistent_workers` reaches the loader |
+| `test_vjepa3_change.py` | weights on a scene with a known answer: the object counts and the background does not, one shown frame that explains a patch is enough, what was never in view counts fully; the weighted loss equals the plain one at weight 1, sums in float32, and pushes in proportion to the weight; the collator sends the weights as a fourth item |
 | `test_vjepa3_masks.py` | default configs get 2.1's own collator, and the v3 generator at defaults reproduces it exactly; a random cut keeps the budget, stays sorted, never shows a hidden position, and evens out the time-steps; whole-time-step masks hide exactly k steps, differently per clip |
 | `tests/train/test_launcher.py` | `app/main.py` exits non-zero when a rank crashes |
 | `tests/scripts/test_ladder_tools.py` | the comparison tool resamples by video and needs both noise sources cleared before calling an arm "clear"; the pre-flight check flags `n1-dyt` and passes healthy arms |
@@ -562,6 +566,8 @@ arm from it; its `ARMS` table is the definition of the ladder.
 | `t1-future` | `mask.0.max_temporal_keep: 0.5` (§9.10) | yes | `a0-control` |
 | `t2-fps12` | `data.fps: 12` (§9.10) | yes | `a0-control` |
 | `t3-frames` | `mask.0.hide_time_steps: 6` (§9.10) | yes | `a0-control` |
+| `t5-frames-weighted` | `t3-frames` + `mask.0.target_weight: unexplained` (§9.11) | yes | `t3-frames` |
+| `w7-warm-frames-weighted` | `w5-warm-frames` + `mask.0.target_weight: unexplained` | yes | `w5-warm-frames` |
 | `t4-whole-clip` | `truncation: random` on both masks (§9.10) | yes | `a0-control` |
 | `w0-warm-control` | released ViT-B encoder, 900 frozen iterations, encoder lr ×0.1 | yes | – |
 | `w2-warm-theta-temporal` | `w0` + `rope_theta: [100, 10000, 10000]` | yes | `w0-warm-control` |
@@ -818,4 +824,66 @@ step to last in the control).
 All four exist from scratch (`t1`–`t4`, against `a0-control`) and on the
 released encoder (`w3`–`w6`, against `w0-warm-control`). Read them in
 `--mode clip`: single-frame mode cannot see a change that is about time.
+
+### 9.11 Weighted targets: do not ask for what can be copied
+
+**The gap.** V-JEPA's authors tried masks that cover less of the clip in time,
+found them worse on action classification, called the task trivial, and kept
+masks that cover the whole clip (Bardes et al., 2024, section E.4). Three
+things were left open:
+
+1. *Trivial was treated as a property of the mask. It is a property of each
+   patch.* A patch that looks the same in a frame the model was shown can be
+   copied; one where something moved cannot. Covering the whole clip removes
+   the first kind by never showing any place at another time, which removes
+   the second kind too.
+2. *Every hidden patch counts the same.* With `loss_exp: 1.0` the slope of
+   the loss is +1 or −1 whatever the error, so a copyable patch pushes on the
+   model as hard as a hard one.
+3. *The camera was ignored.* "The same region in every frame" hides the same
+   content only when the camera is still.
+
+All of it was judged on classification, never on a per-patch task.
+
+**What we measured** (`scripts/measure_change.py`, `PROGRESS.md` §8.1). In the
+training videos, at a 0.25 s gap, 57% of patches are explained by the one
+motion most of the frame shares; at a one-frame gap, 80%. `t3-frames`, which
+hides whole time-steps and counts every patch equally, is the one time-focused
+arm that came out clearly worse than the control (−3.8 in 16-frame mode).
+
+**What `target_weight: unexplained` does.** On a mask with
+`hide_time_steps > 0`, each hidden token gets a weight in [0, 1]:
+
+    for each shown time-step:
+        undo the shift most of the frame shares        change.shared_shift
+        measure what still differs, patch by patch     change.patch_change
+        scale it to [0, 1]                             change.unexplained_weight
+    weight = the smallest of those
+
+and the loss on that mask becomes `sum(w · |error|) / sum(w)`
+(`change.weighted_error`). The other mask keeps V-JEPA's blocks and its plain
+loss. The weights are computed in the data-loading workers by
+`MaskCollatorV3` and travel with the batch; `weight_r0.csv` in the run folder
+records their mean every iteration.
+
+On a synthetic clip (camera pans, one square moves on its own) the square is
+16 of 256 patches: 6% of the push with the plain loss, 68% with the weights.
+On DAVIS the annotated objects are 30% of the patches and receive about half
+of the weight.
+
+**The test.** `t5-frames-weighted` against `t3-frames`: same seed, same mask,
+only the weights differ. If the weighted run is no better, copyable patches
+are not why hiding whole moments hurts.
+
+**Limits.** One shift does not describe zoom, rotation or depth (little is
+explained there and the weights stay near 1, which is `t3-frames`'
+behaviour). "Unexplained" is not "an object". Only the first frame of each
+two-frame token is compared. The scale 0.064 was read off DAVIS, which is
+also the test set. The weights cost about 0.6 s of one data-loading worker per
+clip; whether 24 workers keep up with the GPU is not measured.
+
+**Earlier work.** MGMAE (Huang et al., 2023) and MGM (Fan et al., 2023) use
+motion to decide where a mask is placed in pixel-reconstruction models. One
+search did not turn up a weighting of the loss by unexplained change, or
+either idea applied to a JEPA. That is one search, not a literature review.
 

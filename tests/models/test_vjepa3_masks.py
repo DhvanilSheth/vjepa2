@@ -60,7 +60,14 @@ class TestDefaultIsUpstream(unittest.TestCase):
         for arm in ("a0-control", "s1-sigreg", "t1-future", "t2-fps12", "w0-warm-control"):
             with self.subTest(arm=arm):
                 self.assertIs(type(_collator(arm)), MaskCollator)
-        for arm in ("t3-frames", "t4-whole-clip", "w5-warm-frames", "w6-warm-whole-clip"):
+        for arm in (
+            "t3-frames",
+            "t4-whole-clip",
+            "t5-frames-weighted",
+            "w5-warm-frames",
+            "w6-warm-whole-clip",
+            "w7-warm-frames-weighted",
+        ):
             with self.subTest(arm=arm):
                 self.assertIs(type(_collator(arm)), MaskCollatorV3)
 

@@ -99,6 +99,11 @@ loss:
 #    truncation: tail = cut each batch's token lists to the shortest one from
 #      the END (2.1; leaves the end of every clip largely unused).  random =
 #      keep a random subset of the same size, so the whole clip is used.
+#    target_weight: none = every hidden token counts the same (2.1).
+#      unexplained = needs hide_time_steps > 0; a hidden token counts in
+#      proportion to how much the shown time-steps fail to explain it
+#      (app/vjepa_3/change.py).  target_weight_full: the change that earns
+#      weight 1.
 mask:
 - aspect_ratio:
   - 0.75
@@ -106,6 +111,8 @@ mask:
   full_complement: false
   hide_time_steps: 0
   truncation: tail
+  target_weight: none
+  target_weight_full: 0.064
   max_keep: null
   max_temporal_keep: 1.0
   num_blocks: 8
@@ -121,6 +128,8 @@ mask:
   full_complement: false
   hide_time_steps: 0
   truncation: tail
+  target_weight: none
+  target_weight_full: 0.064
   max_keep: null
   max_temporal_keep: 1.0
   num_blocks: 2

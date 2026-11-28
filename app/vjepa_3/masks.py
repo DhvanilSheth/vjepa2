@@ -4,12 +4,13 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""V-JEPA 3: two optional changes to what a clip's masks hide.
+"""V-JEPA 3: optional changes to what a clip's masks hide, and to how much
+each hidden token counts.
 
-OFF BY DEFAULT.  With neither key set, `build_mask_collator` returns V-JEPA
-2.1's own collator (src/masks/multiseq_multiblock3d.py), untouched.
+OFF BY DEFAULT.  With no key set, `build_mask_collator` returns V-JEPA 2.1's
+own collator (src/masks/multiseq_multiblock3d.py), untouched.
 
-Both keys go on an entry of the config's `mask:` list.
+All keys go on an entry of the config's `mask:` list.
 
 truncation: tail | random
     Every clip in a batch must end up with the same number of visible tokens
@@ -28,10 +29,19 @@ hide_time_steps: 0 | k
     produce a moment it was not shown from the moments around it.  One
     time-step is `tubelet_size` frames.  Counts are equal for every clip, so
     nothing is cut.
+
+target_weight: none | unexplained      (with target_weight_full, default 0.064)
+    Needs hide_time_steps > 0.  "unexplained" gives every hidden token of this
+    mask a weight in [0, 1]: how much the shown time-steps fail to explain it
+    once the motion most of the frame shares is undone.  The weights are
+    computed here, in the data-loading workers, and travel with the batch as a
+    fourth item; train.py uses them in the loss.  See app/vjepa_3/change.py.
 """
 
+import numpy as np
 import torch
 
+from app.vjepa_3.change import resolve_target_weights, target_weights
 from src.masks.multiseq_multiblock3d import MaskCollator, _MaskGenerator
 
 TRUNCATIONS = ("tail", "random")
@@ -39,7 +49,9 @@ TRUNCATIONS = ("tail", "random")
 
 def uses_v3_masking(cfgs_mask):
     return any(
-        m.get("truncation", "tail") != "tail" or int(m.get("hide_time_steps", 0) or 0) > 0
+        m.get("truncation", "tail") != "tail"
+        or int(m.get("hide_time_steps", 0) or 0) > 0
+        or (m.get("target_weight", "none") or "none") != "none"
         for m in cfgs_mask
     )
 
@@ -90,6 +102,40 @@ class MaskCollatorV3(MaskCollator):
                 )
                 for m in cfgs_mask
             ]
+        self.weight_settings = resolve_target_weights(cfgs_mask)
+        self.patch_size = patch_size[0] if isinstance(patch_size, (tuple, list)) else patch_size
+        self.tubelet_size = tubelet_size
+
+    def __call__(self, batch):
+        """As 2.1: one (batch, context ids, target ids) per clip length.  When
+        a mask entry sets `target_weight`, a fourth item is added: per mask, a
+        [batch, n_targets] tensor of weights, or an empty tensor for a mask
+        without weights."""
+        collations = super().__call__(batch)
+        if not any(self.weight_settings):
+            return collations
+        weighted = []
+        for collated, masks_enc, masks_pred in collations:
+            clips = collated[0][0]  # [batch, 3, frames, height, width]
+            per_mask = []
+            for settings, ids_shown, ids_asked in zip(self.weight_settings, masks_enc, masks_pred):
+                if settings is None:
+                    per_mask.append(torch.empty(0))
+                    continue
+                rows = [
+                    target_weights(
+                        clips[b],
+                        ids_shown[b].numpy(),
+                        ids_asked[b].numpy(),
+                        self.tubelet_size,
+                        self.patch_size,
+                        full=settings["full"],
+                    )
+                    for b in range(clips.shape[0])
+                ]
+                per_mask.append(torch.from_numpy(np.stack(rows)))
+            weighted.append((collated, masks_enc, masks_pred, per_mask))
+        return weighted
 
 
 class _MaskGeneratorV3(_MaskGenerator):

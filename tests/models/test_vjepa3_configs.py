@@ -76,8 +76,14 @@ RECIPE_KEYS_ARMS_MAY_CHANGE = {
     "mask.0.max_temporal_keep": 1.0,
 }
 
-# The two v3 keys on every `mask:` entry and the values that give 2.1's masks.
-V3_MASK_DEFAULTS = {"hide_time_steps": 0, "truncation": "tail"}
+# The v3 keys on every `mask:` entry and the values that give 2.1's masks and
+# 2.1's loss.
+V3_MASK_DEFAULTS = {
+    "hide_time_steps": 0,
+    "truncation": "tail",
+    "target_weight": "none",
+    "target_weight_full": 0.064,
+}
 
 # `loss:` keys present in the configs that nothing reads.  Inherited from
 # V-JEPA 2.1 (ladder audit C-17); listed so a NEW orphan is still caught.

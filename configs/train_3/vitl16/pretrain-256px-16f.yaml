@@ -82,6 +82,8 @@ mask:
   full_complement: false
   hide_time_steps: 0
   truncation: tail
+  target_weight: none
+  target_weight_full: 0.064
   max_keep: null
   max_temporal_keep: 1.0
   num_blocks: 8
@@ -97,6 +99,8 @@ mask:
   full_complement: false
   hide_time_steps: 0
   truncation: tail
+  target_weight: none
+  target_weight_full: 0.064
   max_keep: null
   max_temporal_keep: 1.0
   num_blocks: 2

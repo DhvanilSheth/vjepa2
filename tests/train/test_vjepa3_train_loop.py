@@ -235,6 +235,57 @@ class TestTimeFocusedArms(TrainLoopCase):
         self.assertEqual(out["init_data_kwargs"]["fps"], 12)
 
 
+class TestTargetWeights(TrainLoopCase):
+    """`mask.0.target_weight: unexplained` through the real loop.  The tiny
+    clip has 4 time-steps; 2 are hidden."""
+
+    def frames_cfg(self, name, **first_mask):
+        cfg = self.cfg(name)
+        cfg["mask"][0].update(hide_time_steps=2, **first_mask)
+        return cfg
+
+    def rows(self, name):
+        with open(self.root / name / "weight_r0.csv") as f:
+            return list(csv.DictReader(f))
+
+    def test_default_run_writes_no_weight_log(self):
+        run_train(self.cfg("control", epochs=1, ipe=1))
+        self.assertFalse((self.root / "control" / "weight_r0.csv").exists())
+
+    def test_weights_change_the_run_and_are_logged_every_iteration(self):
+        """"smooth" clips are one image sliding across the frame: most of
+        each hidden frame is explained by the shared motion, so the weights
+        are small and the run must differ from the unweighted one."""
+        plain = run_train(self.frames_cfg("plain"), clip_kind="smooth")
+        out = run_train(self.frames_cfg("weighted", target_weight="unexplained"), clip_kind="smooth")
+        self.assertFalse(states_equal(out["latest"]["encoder"], plain["latest"]["encoder"]))
+        for model in MODELS:
+            for value in out["latest"][model].values():
+                self.assertTrue(torch.isfinite(value).all())
+        rows = self.rows("weighted")
+        self.assertEqual(len(rows), 2 * 3)  # epochs x iterations
+        for row in rows:
+            self.assertTrue(0.0 <= float(row["weight_mean"]) <= 1.0)
+            self.assertTrue(0.0 <= float(row["share_above_half"]) <= 1.0)
+
+    def test_weights_of_one_give_the_unweighted_run(self):
+        """With a scale so small that every hidden token gets weight 1, the
+        weighted loss is the plain mean, so the run must match the unweighted
+        one up to the rounding of a sum against a mean."""
+        plain = run_train(self.frames_cfg("plain"))
+        ones = run_train(
+            self.frames_cfg("ones", target_weight="unexplained", target_weight_full=1e-9)
+        )
+        self.assertEqual({float(r["weight_mean"]) for r in self.rows("ones")}, {1.0})
+        self.assertLess(max_abs_diff(ones["latest"]["encoder"], plain["latest"]["encoder"]), 1e-4)
+
+    def test_weights_without_whole_frame_masks_are_refused(self):
+        cfg = self.cfg("bad")
+        cfg["mask"][0]["target_weight"] = "unexplained"
+        with self.assertRaisesRegex(ValueError, "hide_time_steps"):
+            run_train(cfg)
+
+
 class TestClipGrad(TrainLoopCase):
     def _norms(self, name, **optimization):
         norms = []

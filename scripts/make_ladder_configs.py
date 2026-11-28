@@ -132,6 +132,13 @@ FRAMES = {"mask.0.hide_time_steps": 6}
 # of leaving its last quarter largely unused.
 WHOLE_CLIP = {"mask.0.truncation": "random", "mask.1.truncation": "random"}
 
+# Weighted targets: on the mask that hides whole time-steps, a hidden token
+# counts in proportion to how much the shown time-steps fail to explain it
+# once the motion most of the frame shares is undone (app/vjepa_3/change.py).
+# Only meaningful together with FRAMES.  Mask 1 keeps V-JEPA's blocks and its
+# plain loss.
+WEIGHTED = {"mask.0.target_weight": "unexplained"}
+
 # name -> (what it tests, can the encoder be loaded from a 2.1 checkpoint, overrides)
 ARMS = {
     "a0-control": (
@@ -214,6 +221,11 @@ ARMS = {
         True,
         dict(WHOLE_CLIP),
     ),
+    "t5-frames-weighted": (
+        "t3-frames with each hidden token weighted by how much the shown moments fail to explain it.",
+        True,
+        dict(FRAMES, **WEIGHTED),
+    ),
     "w0-warm-control": (
         "Control of the warm-start family: released V-JEPA 2.1 ViT-B encoder, nothing else changed.",
         True,
@@ -243,6 +255,11 @@ ARMS = {
         "t4-whole-clip on top of the released encoder. Compare with w0-warm-control.",
         True,
         dict(WARM_START, **WHOLE_CLIP),
+    ),
+    "w7-warm-frames-weighted": (
+        "t5-frames-weighted on top of the released encoder. Compare with w5-warm-frames.",
+        True,
+        dict(WARM_START, **FRAMES, **WEIGHTED),
     ),
 }
 

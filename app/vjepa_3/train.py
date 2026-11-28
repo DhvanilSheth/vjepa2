@@ -21,6 +21,7 @@ import numpy as np
 import torch
 import torch.multiprocessing as mp
 import torch.nn.functional as F
+from app.vjepa_3.change import resolve_target_weights, weighted_error
 from app.vjepa_3.diagnostics import gaussian_floor, isotropy_report
 from app.vjepa_3.masks import build_mask_collator
 from app.vjepa_3.models.utils.masks_dist import compute_mask_distance
@@ -459,6 +460,20 @@ def main(args, resume_preempt=False):
     # -- V-JEPA 3: with a regulariser on, `loss` in log_r*.csv is the total
     #    that is optimised.  This file keeps the two parts apart, every
     #    iteration, so the prediction loss stays comparable with other arms.
+    # -- V-JEPA 3: with `target_weight` on a mask entry, the collator sends one
+    #    weight per hidden token of that mask (app/vjepa_3/change.py).  This
+    #    file records how much weight there was to learn from, every iteration.
+    target_weight_settings = resolve_target_weights(cfgs_mask, has_cls_first)
+    weight_logger = None
+    if any(target_weight_settings) and rank == 0:
+        weight_logger = CSVLogger(
+            os.path.join(folder, f"weight_r{rank}.csv"),
+            ("%d", "epoch"),
+            ("%d", "itr"),
+            ("%.4f", "weight_mean"),
+            ("%.4f", "share_above_half"),
+        )
+
     reg_logger = None
     if regularizer is not None and rank == 0:
         reg_logger = CSVLogger(
@@ -768,9 +783,9 @@ def main(args, resume_preempt=False):
                 mask_meters[fpc].update(bs / batch_size)
 
             def load_clips():
-                all_clips, all_masks_enc, all_masks_pred = [], [], []
+                all_clips, all_masks_enc, all_masks_pred, all_weights = [], [], [], []
                 for fpc_sample in sample:
-                    udata, masks_enc, masks_pred = fpc_sample
+                    udata, masks_enc, masks_pred = fpc_sample[:3]
                     all_clips += [udata[0][0].to(device, non_blocking=True)]
                     all_masks_enc += [
                         [m.to(device, non_blocking=True) for m in masks_enc]
@@ -778,9 +793,19 @@ def main(args, resume_preempt=False):
                     all_masks_pred += [
                         [m.to(device, non_blocking=True) for m in masks_pred]
                     ]
-                return all_clips, all_masks_enc, all_masks_pred
+                    # -- V-JEPA 3: a fourth item is present only when a mask
+                    #    entry sets `target_weight`; an empty tensor marks a
+                    #    mask without weights.
+                    weights = fpc_sample[3] if len(fpc_sample) > 3 else [None] * len(masks_pred)
+                    all_weights += [
+                        [
+                            None if w is None or w.numel() == 0 else w.to(device, non_blocking=True)
+                            for w in weights
+                        ]
+                    ]
+                return all_clips, all_masks_enc, all_masks_pred, all_weights
 
-            clips, masks_enc, masks_pred = load_clips()
+            clips, masks_enc, masks_pred, target_weights = load_clips()
             data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
 
             if sync_gc and (itr + 1) % GARBAGE_COLLECT_ITR_FREQ == 0:
@@ -852,7 +877,7 @@ def main(args, resume_preempt=False):
                             z_context = normalize_nested(z_context, embed_dim)
                     return z_pred, z_context, z
 
-                def loss_fn(z, h, masks_to_apply, cls_loss, d_weights):
+                def loss_fn(z, h, masks_to_apply, cls_loss, d_weights, t_weights=None):
                     if cls_loss:
                         h_cls = [hi[:, 0].unsqueeze(1) for hi in h]
                         h = [
@@ -890,12 +915,17 @@ def main(args, resume_preempt=False):
                             return loss
                         else:
                             loss, n = 0, 0
-                            for zi, hi in zip(z, h):
-                                for zij, hij in zip(zi, hi):
-                                    loss += (
-                                        torch.mean(torch.abs(zij - hij) ** loss_exp)
-                                        / loss_exp
-                                    )
+                            if t_weights is None:
+                                t_weights = [[None] * len(zi) for zi in z]
+                            for zi, hi, wi in zip(z, h, t_weights):
+                                for zij, hij, wij in zip(zi, hi, wi):
+                                    if wij is None:
+                                        loss += (
+                                            torch.mean(torch.abs(zij - hij) ** loss_exp)
+                                            / loss_exp
+                                        )
+                                    else:
+                                        loss += weighted_error(zij, hij, wij, loss_exp)
                                     n += 1
                             loss /= n
                             return loss
@@ -906,7 +936,12 @@ def main(args, resume_preempt=False):
                     z_pred, z_context, z_enc = forward_context(clips)
                     loss = 0
                     loss_pred = loss_fn(
-                        z_pred, h, masks_pred, cls_loss=has_cls_first, d_weights=None
+                        z_pred,
+                        h,
+                        masks_pred,
+                        cls_loss=has_cls_first,
+                        d_weights=None,
+                        t_weights=target_weights,
                     )
                     loss += loss_pred
 
@@ -1052,6 +1087,13 @@ def main(args, resume_preempt=False):
                 )
                 if reg_stats and reg_logger is not None:
                     reg_logger.log(epoch + 1, itr, reg_stats["main"], reg_stats["reg"])
+                if weight_logger is not None:
+                    sent = torch.cat(
+                        [w.flatten() for group in target_weights for w in group if w is not None]
+                    )
+                    weight_logger.log(
+                        epoch + 1, itr, float(sent.mean()), float((sent > 0.5).float().mean())
+                    )
                 if diag_stats:
                     diag_logger.log(
                         epoch + 1,

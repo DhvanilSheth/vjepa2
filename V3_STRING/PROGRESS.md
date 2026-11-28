@@ -396,11 +396,124 @@ whole frame (`shared_shift`: coarse on the low-pass frames, then exact to the
 pixel; decided by the median) and measures change again after undoing it. It
 reports how many videos fall in each case, and on DAVIS whether the weight
 (`unexplained_weight`) lands on the annotated objects. A `--videos` mode
-samples the training videos, which have no masks. Not yet run on the server
-and not pushed. A single shift does not describe zoom, rotation or depth.
+samples the training videos, which have no masks. A single shift does not
+describe zoom, rotation or depth.
+
+**Measured with the shared motion undone (2026-11-27, threshold 0.012).**
+
+| | DAVIS val (30 videos) | Training videos (200 of 7,376) |
+|---|---|---|
+| Patches changed at 0.25 s, as measured | background 72%, object 96% | 61% |
+| ... after undoing the shared motion | background 40%, object 95% | 43% |
+| Patches changed at one frame, after undoing | background 17%, object 72% | 20% |
+| Median shared shift at 0.25 s | 22 px | 4 px |
+| Videos: still / explained / partly / not explained | 1 / 1 / 18 / 10 | 30 / 32 / 110 / 28 |
+
+- *The rule points at objects, modestly.* On DAVIS objects are 30% of the
+  patches. Their share of the weight rises from 34-39% as measured to 46-58%
+  after undoing the shared motion. About half the weight still lands on
+  background.
+- *Undoing the shared motion removes background, not objects.* Background
+  changed falls from 72% to 40%; object changed stays at 95%.
+- *Training videos are calmer than DAVIS.* At a 0.25 s gap 57% of their
+  patches are explained by the shared motion, and 80% at a one-frame gap. A
+  mask that hides whole moments would spend that share of its targets on
+  trivial patches.
+- *One shift is too crude for a third of DAVIS and a seventh of the training
+  videos* ("not explained"); over half of both are only partly explained.
+- *Still no two groups* after undoing the shared motion. The soft weight
+  stands.
+- The training-video reader works on real files (0 of 200 unreadable).
+
+### 8.2 Continuing from Meta's encoder: `w0-warm-control` (scored 2026-11-28)
+
+Meta's ViT-B encoder, our training loop unchanged, 30 epochs of the screening
+recipe (`freeze_encoder_iters: 900`, `encoder_lr_scale: 0.1`).
+
+| Checkpoint | Single-frame J&F | Small / medium / large | 16-frame J&F |
+|---|---|---|---|
+| Meta, as released | 68.9 | 47.3 / 71.2 / 78.7 | 62.3 |
+| after 10 epochs | 68.3 | 47.0 / 70.1 / 78.4 | not measured |
+| after 30 epochs | 66.0 | 44.7 / 67.6 / 76.2 | 60.5 |
+
+- The encoder is not wrecked, but it erodes: 0.6 points after a third of the
+  run, 2.9 by the end. The recipe pulls a strong encoder towards what this
+  small recipe can support (about 35 from scratch).
+- Arms on this track are compared with 66.0, not 68.9. Training noise on this
+  track is not measured.
+- 16-frame mode is 5.5 points below single-frame for this model. Meta's own
+  model shows the same drop (68.9 to 62.3), so it is not caused by our
+  training. The losses are largest on fast-motion videos. Two candidate
+  causes, not yet separated: the test feeds frames 1/24 s apart to a model
+  trained on wider spacing, and each token covers two frames, so one feature
+  map has to serve two frames in which a fast object sits in two places.
+  Until that is checked, 16-frame mode is safe for comparing runs with each
+  other and not for judging how well a model uses time.
+- In 16-frame mode the erosion from our training is 1.8 points (62.3 to 60.5).
 
 `w0-warm-control` started on the server at 12:14 on 2026-11-27; its log
-confirms the encoder was initialised from Meta's file. Not yet scored.
+confirms the encoder was initialised from Meta's file.
+
+### 8.3 The four plain time-focused runs (scored 2026-11-28)
+
+From scratch, screening recipe, epoch 30. The two controls set the band.
+
+| Run | What it changes | Single-frame | 16-frame |
+|---|---|---|---|
+| `t4-whole-clip` | uses the whole clip evenly | 36.6 | 34.6 |
+| `a0-control` | nothing | 34.9 | 35.0 |
+| `t1-future` | context from the first half only | 34.3 | 33.3 |
+| `t2-fps12` | 12 frames per second instead of 4 | 33.0 | 33.6 |
+| `t3-frames` | hides whole moments | 33.1 | 31.2 |
+| `a0-control-s2` | nothing, second seed | 32.3 | 32.4 |
+
+- None beats the control by the 3 points the screen can resolve.
+- `t3-frames` is the lowest, and in 16-frame mode it is below both controls.
+  That fits the measurement in 8.1 (over half of its targets are trivial in
+  the training videos), but one run inside the noise does not prove it.
+- `t2-fps12` is the only run that scores higher with 16 frames than with one
+  (+0.6); the others lose 1 to 2 points. Too small to read alone.
+
+Verdicts from `compare_tracking.py` against `a0-control` (noise 2.6):
+
+| Run | Single-frame | 95% range | 16-frame | 95% range | Verdict |
+|---|---|---|---|---|---|
+| `t4-whole-clip` | +1.7 | +0.8 to +2.8 | −0.4 | −2.4 to +1.9 | inside noise |
+| `t1-future` | −0.6 | −1.6 to +0.5 | −1.7 | −2.7 to −0.8 | inside noise |
+| `t2-fps12` | −1.9 | −3.5 to −0.6 | −1.4 | −2.9 to +0.0 | inside noise |
+| `t3-frames` | −1.8 | −3.7 to −0.3 | −3.8 | −5.8 to −1.2 | clear: worse (16-frame); 13 objects better, 48 worse |
+
+`t3-frames` is the baseline the content-based rule of 8.1 has to beat.
+
+### 8.4 The research gap, and the first build against it (2026-11-28)
+
+**The gap in V-JEPA's masking study** (its section E.4, 26 runs on a ViT-B,
+all judged on action classification): shortening the mask in time made scores
+worse, the task was called trivial, and the mask was extended over the whole
+clip. Three things were left open:
+
+1. Trivial is a property of each patch, not of the mask. Covering the whole
+   clip removes the copyable patches and, with them, the patches where
+   something moved.
+2. Every hidden patch counts the same in the loss, and with an absolute-error
+   loss each pushes equally hard.
+3. The camera is ignored; and nothing was scored on a per-patch task.
+
+Their observation holds in our hands: `t3-frames` is clearly worse than the
+control. What is new is the explanation (57% of its targets can be copied)
+and a way to test it. LeJEPA does not use this masking at all: it compares
+crops of an image.
+
+**Built** (`README.md` §9.11): `app/vjepa_3/change.py` and
+`target_weight: unexplained` on a mask entry. Each hidden token of a
+whole-time-step mask is weighted by how much the shown time-steps fail to
+explain it once the shared motion is undone. Arms `t5-frames-weighted`
+(against `t3-frames`) and `w7-warm-frames-weighted` (against
+`w5-warm-frames`). 320 tests pass; 22 deliberate breakages each caught; the
+default path is still bit-for-bit V-JEPA 2.1; the pre-flight passes.
+
+**Not verified:** nothing has run on the GPU. The weights cost about 0.6 s of
+one data-loading worker per clip; whether training slows down is unknown.
 
 ## 9. Next steps, in order
 
@@ -421,7 +534,10 @@ healthy run, first ladder ranked (section 4), Meta's ViT-B scored.
 4. **Here:** read the time-focused arms in 16-frame mode against both
    controls. An arm counts only if it beats `a0-control` by more than the 2.6
    point gap; anything that does gets a second seed.
-5. **Server, later:** `s1-sigreg` and `s2-visreg`. Check `reg_r0.csv` after
+5. **Server, next:** `t5-frames-weighted` (about 5 h, possibly more: watch
+   the iteration time). Compare with `t3-frames` in both modes; check
+   `weight_r0.csv` after the first epoch.
+6. **Server, later:** `s1-sigreg` and `s2-visreg`. Check `reg_r0.csv` after
    the first epoch.
    Then `n3-dyt-sigreg`, only if `s1-sigreg` is healthy. Pre-flight on
    2026-11-27 (one step, float32, synthetic clips): SIGReg lifts the encoder
